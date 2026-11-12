@@ -93,7 +93,7 @@ export function resolveCuts({
   scan, scanMode = 'mc', capGap = 0, strategy, refineBursts = true,
   allowStillSpikes = true, allowRefineBursts = true,
   textOnly = false, precomputed = null, fps, winStart, winDur,
-  prints = null, means = null,
+  prints = null, means = null, printFps = null, scoresPack = null,
 }) {
   const trace = [];
   let cuts = scan.cuts ?? [];
@@ -146,9 +146,35 @@ export function resolveCuts({
 
   // ---- 4. 打标签：**一个都不删**（删掉误检会让这段在插件眼里变成"完全静止"）
   if (!textOnly && Array.isArray(prints) && prints.length) {
+    // ⚠️ 指纹可能是**打包过的低帧率版本**（缓存命中时 `packPrints` 把 24fps 压到 8fps）。
+    // 用真实 fps 去算下标会整体错位：evidence 变 null 或乱判，白闪剔除随之失效。
+    // 所以这里用指纹自己的帧率；`scores` 是按真实帧存的，帧率不一致时不喂给 tagCuts。
+    const tagFps = Number(printFps) > 0 ? Number(printFps) : fps;
+    const sameRate = !(Number(printFps) > 0) || Math.abs(Number(printFps) - Number(fps)) < 1e-6;
     cuts = tagCuts(cuts, {
-      prints, means, fps, scores: scan.stats?.map((s) => s.score),
+      prints,
+      means,
+      fps: tagFps,
+      ...(sameRate
+        ? { scores: scan.stats?.map((s) => s.score) }
+        : (Array.isArray(scoresPack) ? { scores: scoresPack } : {})),
     });
+  }
+
+  // ---- 5. 只删「转场型白闪」：模型说是转场，而亮度证据说是"亮了一下又回来"
+  //
+  // 这一段**必须排在 4 之后**：它读的就是 4 打出来的 `type` 和转场后端给的 `kind`。
+  // 判据是两条 AND，缺一不可：
+  //   ① `kind === 'transition'` —— 只有转场后端（OmniShotCut）会产出这种切点；
+  //      纯 HSV 路径没有这个字段，因此**行为逐位不变**（这是不回归的关键）。
+  //   ② `type === 'flash'` —— flash.js 的 pulse/nv/corr 三条件已经成立：
+  //      亮度冲高过、又回到原样、结构没变。白闪**转场**的 nv 很大，不会被误伤。
+  // 为什么只在这一种组合下删：删除会丢掉"这里在动"的信息（见 flash.js 头注释），
+  // 而"转场型白闪"是个例外 —— 它既不是新镜头，也不是连续运动，留着只会多出一格。
+  if (!textOnly && cuts.some((c) => c?.type === 'flash' && c?.kind === 'transition')) {
+    const before = cuts.length;
+    cuts = cuts.filter((c) => !(c?.type === 'flash' && c?.kind === 'transition'));
+    trace.push(`drop-flash-transition:${before}->${cuts.length}`);
   }
 
   return { cuts, refinedBursts, trace };

@@ -88,15 +88,26 @@ export function flashEvidence({ prints, means, t, fps, deltaSec = DELTA_SEC, sco
   const hi = Math.min(prints.length - 1, center + delta);
   if (hi <= lo) return null;
 
+  // **means 与 prints 必须同长**：命中缓存时 prints 是打包过的低帧率版本（8fps），
+  // 而 means 可能是原始帧率 —— 两者下标不一致，pulse 会算成噪声（实测 04-flash 在缓存
+  // 命中时把白闪判成 dissolve）。长度不一致就从指纹里现算亮度（同源同长，代价极小）。
+  const bright = Array.isArray(means) && means.length === prints.length
+    ? means
+    : prints.map((fp) => {
+      let sum = 0;
+      for (let i = 0; i < fp.length; i++) sum += fp[i];
+      return sum / Math.max(1, fp.length);
+    });
+
   // ① 亮度脉冲：相对两端基线的最大正向偏离
-  const base = (means[lo] + means[hi]) / 2;
+  const base = (bright[lo] + bright[hi]) / 2;
   let pulse = 0;
   let minV = 255;
   let maxV = 0;
   for (let i = lo; i <= hi; i++) {
-    pulse = Math.max(pulse, means[i] - base);
-    minV = Math.min(minV, means[i]);
-    maxV = Math.max(maxV, means[i]);
+    pulse = Math.max(pulse, bright[i] - base);
+    minV = Math.min(minV, bright[i]);
+    maxV = Math.max(maxV, bright[i]);
   }
 
   // ② 净位移：先做全局平移补偿，再取残差（挡快速甩镜）

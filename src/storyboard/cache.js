@@ -24,7 +24,7 @@ import { configuredText, readVideoFile } from './user-config.js';
 // 条目就是几十 MB 的 {"0":12,…} 且类型全丢。现在指纹已改为不进缓存，升版本把可能写坏的条目作废。
 // 3 → 4：扫描结果里新增了 darkRuns（黑场段）。旧条目没有这一项，命中后黑场会并回内容格，
 // 同一支片子第一次跑和第二次跑出图不一样 —— 升版本让旧条目重扫一次。
-export const CACHE_VERSION = 26;
+export const CACHE_VERSION = 32; // 32: 缓存存按指纹帧率压过的分数曲线（保证 tagCuts 在命中时判定一致）
 // 25 → 26：切点链路的编排搬进 cuts.js（行为不变），同时新增 `cutFloor` 维度并进了
 // cacheKey —— 同一份文件按不同门槛扫描会得到不同的 cuts，旧键里没有这个维度。
 // 4 → 5：扫描结果里新增了**抽稀指纹**（printPack，8fps base64）。

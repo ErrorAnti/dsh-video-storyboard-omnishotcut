@@ -127,3 +127,32 @@ v1 把转场折叠成一个中点切点，转场宽度只进了清单文字。v2
 
 实测（`02b-dissolve1s.mp4`，6 镜头 / 5 段 1 s 叠化）：
 v1 = 5 帧（4 格）→ v2 = **11 帧 / 1 张 / 档位 1/2×1 1/3×5 1/4×5，填充 84.4%**。
+
+## 8. 后续两项（P1/P2，已落地）
+
+### 8.1 转场型白闪：唯一允许删刀的地方
+
+`cuts.js` 阶段 5：`kind === 'transition'` **且** `type === 'flash'` 的切点才删。
+
+- 只有 osm 会产出 `kind:'transition'`，所以 **HSV 路径行为逐位不变**；
+- 白闪**转场**（画面真的换了）的 `nv` 很大，命中不了 `flash` 判据；
+- 删除会留 `trace: drop-flash-transition:N->M`，清单能解释"为什么少了一刀"；
+- 删了切点，**它的转场区间也要一起失效**（`keptTransitions`），否则 `framesFromBounds` 会照着那段再切一个 0.08 秒的转场格。
+
+实测：`04-flash` 6 刀 → **5 刀**（与真值一致）。
+
+### 8.2 切点分数补偿
+
+`fillCutsScore(cuts, hsv.stats)`：用 HSV 曲线在切点 ±0.12 s 的**峰值**填 `score`
+（窗口内没采样就退到最近一帧）。目的只有一个 —— 让 `cuts.js` 阶段 3 的
+`suppressClose`「保留分数更高的一刀」不再退化成"保留第一个"。
+
+### 8.3 一个必须知道的缓存陷阱
+
+缓存里的 `printPack` 是 **8 fps** 打包指纹，而 `means` / `stats` 是按真实帧存的。
+打标签时若用 `fps=24` 去索引 8 fps 的指纹，证据全错位 —— 表现为「同一段视频第一次 5 刀、
+第二次 6 刀，标签从 hardcut 变成 dissolve」。
+
+修法：`cuts.js` 用 `printFps` 作 `tagFps`；`flash.js` 在 `means.length !== prints.length`
+时从指纹现算亮度；缓存补存按指纹帧率压过的 `scores`。详见项目仓库
+`docs/incidents/缓存命中的指纹是-8fps.md`。

@@ -118,6 +118,25 @@ export function requireOmniShotCut(cfg) {
   return { python: osm.python, bridge: osm.bridge, ckpt: osm.ckpt, source: osm.source };
 }
 
+/**
+ * 把逐帧分数曲线压到指纹帧率（每个桶取最大值）。
+ *
+ * 为什么需要：缓存里的指纹是 `packPrints` 压过的低帧率版本（24fps → 8fps），
+ * 而 `stats` 是按真实帧存的。两者帧率不一致时，`flash.js` 的 `conc`（过渡集中度）
+ * 用错帧率的下标会算成噪声，于是同一段视频第一次跑标 `hardcut`、第二次标 `dissolve`。
+ */
+function packScoresAt(stats, n) {
+  if (!Array.isArray(stats) || !stats.length || !(n > 0)) return null;
+  const out = new Array(n).fill(0);
+  const k = Math.max(1, stats.length / n);
+  for (let i = 0; i < stats.length; i++) {
+    const j = Math.min(n - 1, Math.floor(i / k));
+    const v = Number(stats[i]?.score);
+    if (Number.isFinite(v) && v > out[j]) out[j] = v;
+  }
+  return out.map((x) => +x.toFixed(2));
+}
+
 export async function runStoryboard(opts) {
   const {
     input: inputRaw,
@@ -389,6 +408,12 @@ export async function runStoryboard(opts) {
         cuts: s.cuts, stats: s.stats, frames: s.frames,
         threshold: s.threshold, degraded: s.degraded, summary: s.summary,
         printPack: s.prints?.length ? packPrints(s.prints, info.fps) : null,
+        // 亮度均值也要进缓存：flash.js 判 flash 需要 means + prints；少了 means 它直接
+        // 返回 type:null，转场型白闪剔除就会在缓存命中时失效（第一次 5 刀、第二次 6 刀）。
+        means: Array.isArray(s.means) ? s.means.map((x) => +Number(x).toFixed(1)) : null,
+        // 分数曲线按**指纹帧率**存一份：缓存命中时指纹是 8fps，直接拿 24fps 的 stats
+        // 去给 tagCuts 算 conc 会错位，结果同一段视频两次跑的 type 不一样（hardcut/dissolve）。
+        scores: packScoresAt(s.stats, s.prints?.length ? unpackPrints(packPrints(s.prints, info.fps)).length : 0),
         // 后端自己的东西只在真是那个后端时才写进条目：hsv 的缓存 JSON 一个字节都不多，
         // 而 omnishotcut 的条目必须自带 transitions —— 否则第二次命中缓存就突然少一行 `grad:`。
         ...(osm ? {
@@ -408,6 +433,10 @@ export async function runStoryboard(opts) {
     scanPrints = scan.printsRaw;
     printFps = info.fps;
   }
+  // 缓存命中时回调没跑，means 只能从条目里取回来（见上面写缓存处）
+  if (!scanMeans && Array.isArray(scan.means)) scanMeans = scan.means;  if (process.env.DSH_DEBUG_TRANSITIONS) {
+    console.error('[dbg] prints', scanPrints?.length, 'printFps', printFps, 'means', scanMeans?.length, 'fps', info.fps, 'cached', scan.cached);
+  }
   if (cache && !scan.cached && !precomputed) await pruneStorage();
   mark('scan');
 
@@ -418,7 +447,7 @@ export async function runStoryboard(opts) {
    * 清单靠它说一句 `grad:`（契约 §4）。命中缓存时也带着它（写进了缓存条目），
    * 否则第二次跑同一窗口会突然少一行，看起来像后端掉了。
    */
-  const transitions = Array.isArray(scan.transitions) && scan.transitions.length
+  let transitions = Array.isArray(scan.transitions) && scan.transitions.length
     ? scan.transitions : null;
   const osmInfo = scan.osm ?? null;
 
@@ -436,7 +465,8 @@ export async function runStoryboard(opts) {
     allowStillSpikes: !osm,
     allowRefineBursts: !osm,
     fps: info.fps, winStart, winDur,
-    prints: scanPrints, means: scanMeans,
+    prints: scanPrints, means: scanMeans, printFps,
+    scoresPack: Array.isArray(scan.scores) ? scan.scores : null,
   });
   cuts = cutChain.cuts;
   const refinedBursts = cutChain.refinedBursts;
@@ -488,6 +518,17 @@ export async function runStoryboard(opts) {
       label: tr?.label ?? null,
     }))
     .filter((tr) => Number.isFinite(tr.from) && Number.isFinite(tr.to) && tr.to - tr.from > 0.05);
+
+  // **被删掉的切点，它的转场区间也要一起失效**：cuts.js 阶段 5 会剔除「转场型白闪」，
+  // 但 `relTransitions` 来自扫描结果，不过滤的话 framesFromBounds 会照着这段再切出
+  // 一个 0.08 秒的转场格 —— 等于删了又加回来。
+  const keptTransitions = relTransitions.filter((tr) => cuts.some(
+    (c) => c.t >= tr.from - 0.05 && c.t <= tr.to + 0.05,
+  ));
+  // 清单（format）读的是 scan.transitions：这里一起收窄，否则会出现
+  // 「grad: 1 transition(s) — fade 1」却说不出是哪一格（那一刀已经被删了）。
+  scan.transitions = keptTransitions;
+  transitions = keptTransitions.length ? keptTransitions : null;
 
   // **落在转场区间内部的中点切点要丢掉**：转场自己的两个边界已经是段边界，
   // 再留中点只会把转场劈成两半（实测：2.042–3.0 的叠化被 2.52 的中点切成两段，
@@ -561,7 +602,7 @@ export async function runStoryboard(opts) {
   const build = (cap) => {
     let sg = framesFromBounds({
       duration: winDur, start: winStart, cuts: segCuts, marks: sampleMarks,
-      transitions: relTransitions, maxFrames: cap,
+      transitions: keptTransitions, maxFrames: cap,
     });
     if (Number(minFrames) > 1) sg = ensureMinFrames(sg, Math.min(24, Math.round(Number(minFrames))));
     /**
@@ -1095,7 +1136,7 @@ export async function runStoryboard(opts) {
     // 却全被报成 "1 image"，模型据此选档等于闭眼开车。
     const freeSegs = framesFromBounds({
       duration: winDur, start: winStart, cuts: segCuts, marks: sampleMarks,
-      transitions: relTransitions,
+      transitions: keptTransitions,
     });
     const freeRaw = applyMarkBoost(freeSegs.map((s) => levelAt(curve, s.t - winStart)), freeSegs);
     const variants = [...AUTO_CANDIDATES, 'skim'].map((name) => {

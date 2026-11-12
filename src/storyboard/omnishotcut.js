@@ -423,9 +423,37 @@ export async function hybridScan(opts = {}) {
   return {
     ...hsv,
     // 契约 §2.1：cuts 取 OmniShotCut 的（覆盖 hsv 的），排序去重
-    cuts: dedupeCuts(osm.cuts, OSM_MIN_GAP),
+    cuts: fillCutsScore(dedupeCuts(osm.cuts, OSM_MIN_GAP), hsv.stats),
     scoring: { ...(hsv.scoring || {}), detector: OSM_DETECTOR_ID, cutSource: 'omnishotcut' },
     transitions: osm.transitions,
     osm: { ms: osm.ms, shots: osm.shots, fps: osm.fps },
   };
+}
+
+/**
+ * 给 OmniShotCut 的切点补一个**有实际含义**的分数。
+ *
+ * 模型只给边界不给 0–255 曲线，所以 `score` 原本恒为 0；下游 `cuts.js` 阶段 3
+ * （丐中丐合并）用 `suppressClose` 时会"保留分数更高的那一刀"，恒 0 就退化成"保留第一个"。
+ * 这里借 HSV 曲线在切点邻域的峰值填进去：量级与 HSV 一致，合并时的取舍才有意义。
+ *
+ * 不改 `kind` / `label` / `from` / `to`，也不动顺序。
+ */
+export function fillCutsScore(cuts, stats, halfWindowSec = 0.12) {
+  if (!Array.isArray(cuts) || cuts.length === 0) return cuts ?? [];
+  if (!Array.isArray(stats) || stats.length === 0) return cuts;
+  return cuts.map((c) => {
+    let best = null;
+    let nearest = null;
+    for (const s of stats) {
+      const t = Number(s?.t);
+      const sc = Number(s?.score);
+      if (!Number.isFinite(t) || !Number.isFinite(sc)) continue;
+      const d = Math.abs(t - Number(c.t));
+      if (!nearest || d < nearest.d) nearest = { d, sc };
+      if (d <= halfWindowSec && (best === null || sc > best)) best = sc;
+    }
+    const score = best ?? nearest?.sc ?? 0;
+    return { ...c, score: +Number(score).toFixed(2) };
+  });
 }
