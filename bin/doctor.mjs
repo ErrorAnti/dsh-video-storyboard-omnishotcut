@@ -18,7 +18,9 @@ import { DEFAULT_FFMPEG, DEFAULT_FFPROBE, mediaCandidates } from '../src/storybo
 import { canTranscribe, describeAsrTarget, resolveAsrConfig } from '../src/storyboard/asr.js';
 import { mediaDir } from '../src/storyboard/media-store.js';
 import { discoverYtdlp } from '../src/storyboard/ytdlp.js';
-import { DETECTOR_IDS, resolveDetectorConfig } from '../src/storyboard/user-config.js';
+import { resolveDetectorConfig } from '../src/storyboard/user-config.js';
+// 自检项由**注册表**里那一项提供（`doctorChecks`）：doctor 只负责打印，不认识任何后端细节。
+import { DETECTOR_IDS, getDetector } from '../src/storyboard/detectors/index.js';
 import { execFile } from 'node:child_process';
 
 const ok = (m) => console.log(`  ✅ ${m}`);
@@ -130,67 +132,32 @@ console.log('\n5) 切点后端 detector（默认 hsv：零依赖；omnishotcut�
 const det = resolveDetectorConfig();
 const detSource = { arg: '显式传参', env: '环境变量 DSH_VIDEO_DETECTOR', file: det.configPath, default: '内置默认' }[det.source]
   ?? det.source;
-if (!DETECTOR_IDS.includes(det.detector)) {
+const detector = getDetector(det.detector);
+if (!detector) {
   bad(`detector="${det.detector}" 不认识（来自 ${detSource}）—— 只认 ${DETECTOR_IDS.join(' / ')}`);
   console.log('     → 改 ~/.dsh/video.json 的 "detector"，或清掉 DSH_VIDEO_DETECTOR');
   hardFail += 1;
-} else if (det.detector === 'hsv') {
-  ok(`detector=hsv（${detSource}）—— HSV 路径，不需要 python / 权重`);
-  console.log('     → 想换 OmniShotCut：~/.dsh/video.json 写');
-  console.log('       { "detector": "omnishotcut", "omnishotcut": {');
-  console.log('         "python": "D:/osm/.venv/Scripts/python.exe", "ckpt": "D:/osm/omnishotcut.ckpt" } }');
-  console.log('       （或设 DSH_VIDEO_DETECTOR / DSH_OSM_PYTHON / DSH_OSM_CKPT）');
 } else {
-  // detector=omnishotcut：三件东西都得能当场跑起来，缺一条就**硬失败**（不会静默回退 hsv）
-  const osm = det.omnishotcut;
-  console.log(`     配置来源：${det.configPath}（detector: ${detSource}）`);
-  if (!osm.python) {
-    bad('没配 python —— detector=omnishotcut 起不来（不会回退到 hsv）');
-    console.log('     → ~/.dsh/video.json 的 "omnishotcut.python" 指到装好 omnishotcut 的解释器，');
-    console.log('       或设 DSH_OSM_PYTHON（Windows 例：D:/osm/.venv/Scripts/python.exe）');
-    hardFail += 1;
-  } else {
-    // 光"能执行"不够：要的那一个包必须真能 import 进来（与 findPython 同一判据）
-    const r = await run(osm.python, ['-c',
-      'import omnishotcut,sys;print(getattr(omnishotcut,"__version__","?"));print(sys.version.split()[0])']);
-    if (r.code === 0) {
-      const [ver = '?', pyVer = '?'] = r.stdout.trim().split(/\r?\n/);
-      ok(`python: ${osm.python} — import omnishotcut ${ver} (Python ${pyVer})`);
-    } else {
-      const why = (r.stderr || r.stdout || '').trim().split(/\r?\n/).pop() ?? '';
-      bad(`python 跑不起来或 import omnishotcut 失败：${osm.python}`);
-      if (why) console.log(`       ${why.slice(0, 160)}`);
-      console.log('     → 在那台解释器里装：pip install omnishotcut torch；');
-      console.log('       若是 "No module named omnishotcut"，说明配的是另一个环境');
-      hardFail += 1;
+  /**
+   * 后端自己说该查什么（`detectors/index.js` 的 `doctorChecks`）：
+   * 每项 `{name, ok, detail?, lines?, quiet?, fatal?}` —— `quiet` 是"只印 lines、没有 ✅/❌"
+   * （配置来源那一行），`ok:false` 默认算硬伤（`fatal:false` 可豁免）。
+   * `run` / `stat` 注入进去，所以自检逻辑本身不用起进程也能测。
+   */
+  const checks = await detector.doctorChecks({
+    config: det,
+    sourceText: detSource,
+    run,
+    stat: (p) => stat(p).catch(() => null),
+  });
+  for (const item of checks) {
+    if (item.quiet) {
+      for (const line of item.lines ?? []) console.log(line);
+      continue;
     }
-  }
-  // 权重要有，而且明显不对（几十 KB 的占位文件 / 配置文件）要当场说，别等第一次推理才炸
-  const MIN_CKPT = 100 * 1024 * 1024;
-  if (!osm.ckpt) {
-    bad('没配 ckpt（权重）—— detector=omnishotcut 起不来（不会回退到 hsv）');
-    console.log('     → "omnishotcut.ckpt" 指到权重文件，或设 DSH_OSM_CKPT');
-    hardFail += 1;
-  } else {
-    const st = await stat(osm.ckpt).catch(() => null);
-    if (!st) {
-      bad(`权重不存在：${osm.ckpt}`);
-      console.log('     → 路径写错也会长这样（相对路径按**当前目录**解析，建议写绝对路径）');
-      hardFail += 1;
-    } else if (st.size <= MIN_CKPT) {
-      bad(`权重太小：${osm.ckpt} 只有 ${(st.size / 1048576).toFixed(1)} MB（要 > 100 MB）`);
-      console.log('     → 多半是没下完 / 下成了 Git LFS 指针文件，重下一次');
-      hardFail += 1;
-    } else {
-      ok(`权重：${osm.ckpt} (${(st.size / 1048576).toFixed(0)} MB)`);
-    }
-  }
-  if (osm.bridgeExists) ok(`Python 桥：${osm.bridge}`);
-  else {
-    bad(`Python 桥不在：${osm.bridge ?? '(未解析)'}`);
-    console.log('     → 用包里那份 src/storyboard/omnishotcut-bridge.py；');
-    console.log('       自定义的位置写进 "omnishotcut.bridge" 或 DSH_OSM_BRIDGE');
-    hardFail += 1;
+    if (item.detail) (item.ok ? ok : bad)(item.detail);
+    for (const line of item.lines ?? []) console.log(line);
+    if (!item.ok && item.fatal !== false) hardFail += 1;
   }
 }
 

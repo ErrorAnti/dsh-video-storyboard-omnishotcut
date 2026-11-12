@@ -2,6 +2,11 @@
 
 > 角色：本次改动的**唯一接口依据**。两个实施代理按本文写代码，不得单方面改名/改形状。
 > 分支：`feat/omnishotcut`（已在 `dsh-video-storyboard` v0.7.4 的 clone 上创建）。
+>
+> **2026-11-13 增补（纯重构，对外行为逐位不变）**：pipeline 里三处
+> `detector === 'omnishotcut'` 字符串分支换成**注册表**（`src/storyboard/detectors/`）。
+> 后端自己的知识（配置校验 / 扫描 / 自检）收在适配器里，pipeline 只查表 → 调 `scan` → 拼形状。
+> 详见 §2.2 与 §3。
 
 ## 0. 目标（只要这三条）
 
@@ -72,18 +77,63 @@ export async function hybridScan({
 - 其余字段**原样**从 hsv 结果透传，一个都不许改（`tiers.integralMarks` / `flash.tagCuts` 依赖它们）。
 - `hybridScan` 内部：先 `hsvScan` 再跑 OmniShotCut（并行也可以，但错误要能归属到具体哪一路）。
 
-## 3. pipeline 接线
+### 2.2 注册表接口（`resolve` / `scan` / `doctorChecks`）
 
-`runStoryboard(opts)` 新增：
+适配器文件同时是本后端"知识的唯一存放处"。`detectors/omnishotcut.js` 那一项只做声明 + 懒加载，
+实现在这里：
+
+| 函数 | 谁调 | 干什么 |
+|---|---|---|
+| `resolve(cfg)` | `pipeline.runStoryboard` | 校验 python/ckpt/桥；缺 `python`/`ckpt` → `err.code='osm-not-configured'`，桥不在 → `'osm-bridge-missing'`。**抛，不回退** |
+| `scan(opts)` | `pipeline.runStoryboard` | `opts = {input, fps, start, end, env, curve, …}`；`curve` 是 HSV 回调，`env` 是 `resolve()` 的返回。内部就是 `hybridScan` |
+| `doctorChecks(ctx)` | `bin/doctor.mjs` | 返回 `[{name, ok, detail?, lines?, quiet?, fatal?}]`；`run`/`stat` 由 doctor 注入（不起进程也能测） |
+
+`minGap`（0.08）由注册表那一项喂进 `hybridScan`，不再在这里写死；`hybridScan` 的直接调用方
+仍然拿默认值，行为不变。
+
+## 3. 注册表（`src/storyboard/detectors/index.js`）
+
+**这一节取代了原先的"pipeline 里写 `detector==='omnishotcut'`"** —— 那种写法接第三个模型时要改三处，
+漏一处就是"看着跑通了、cuts 却来自另一个后端"。
+
+每个后端是表里的一项：
+
+```js
+{
+  id: 'omnishotcut',                 // 配置里写的名字，也是 cacheKey 的 detector 维
+  label: 'OmniShotCut v1.5',
+  needsCurve: true,                  // 是否要 HSV 逐帧曲线（现役都是 true）
+  bypassStages: ['still-spikes', 'refine-bursts'],   // 要关掉的 cuts.js 阶段
+  minGap: 0.08,                      // 切点最小间隔，喂给后端自己的 dedupe
+  resolve(cfg), scan(opts), doctorChecks(ctx),
+}
+```
+
+`pipeline.runStoryboard` 只做三件事：`getDetector(id)` → `await impl.resolve(cfg)` → `await impl.scan(...)`，
+然后把结果拼成既有形状。`DETECTOR_IDS` 从表里推出来（`user-config.js` re-export），
+所以"只认哪些名字"的报错、doctor 的列举、配置校验全都自动跟着表走。
+
+接第三个后端 = **桥 + 适配器两处**（本文件 §1 / §2 的同类物），外加：
+
+1. `detectors/<name>.js`：二十来行声明（照 `detectors/omnishotcut.js` 抄）；
+2. `detectors/index.js` 的 `ENTRIES` 加一项。
+
+`test/detectors.test.mjs` 盯着不变量：表里每个 id 都能被 `getDetector` 解析、`DETECTOR_IDS` 与表一致、
+`bypassStages` 只能是 `cuts.js` 真有的阶段名、`pipeline.js` 里不许再有按后端名分叉的字符串比较。
+
+### 3.1 pipeline 接线
+
+`runStoryboard(opts)` 参数不变：
 
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `detector` | `'hsv' \| 'omnishotcut'` | `'hsv'` | 配置文件 `~/.dsh/video.json` 的 `detector`，环境变量 `DSH_VIDEO_DETECTOR` 优先 |
-| `omnishotcut` | `{python, bridge, ckpt}` | 由配置/环境解析 | 缺任一字段且 `detector='omnishotcut'` → 抛结构化错误，**不静默回退** |
+| `detector` | 注册表里的任一 id | `'hsv'` | 配置文件 `~/.dsh/video.json` 的 `detector`，环境变量 `DSH_VIDEO_DETECTOR` 优先 |
+| `omnishotcut` | `{python, bridge, ckpt}` | 由配置/环境解析 | 只有选中该后端时才校验；缺字段 → 抛结构化错误，**不静默回退** |
 
-- `detector==='omnishotcut'` 时：`scan` 来自 `hybridScan`；`scanMode` 仍然决定 HSV 曲线的口径（默认 `mc`）。
-- 缓存：`cacheKey` 必须并入 `detector` 与 `ckpt` 的 sha256（没有 sha256 就用 mtime+size）；**不加这条会出现"换了后端却命中旧缓存"**。
-- `cuts.js` 的 `resolveCuts` 新增两个开关，`omnishotcut` 时都传 `false`：
+- 缓存：`cacheKey` 并入 `detector`（表里的 id）与 `ckpt` 的 sha256（没有 sha256 就用 mtime+size）；
+  **不加这条会出现"换了后端却命中旧缓存"**。
+- `cuts.js` 的 `resolveCuts` 两个开关由表里那一项的 `bypassStages` 驱动
+  （`omnishotcut` 声明了两个 → 都传 `false`；`hsv` 是空数组 → 都开着）：
   - `allowStillSpikes`（阶段 1 极静补刀）
   - `allowRefineBursts`（阶段 2 爆点细扫）
   理由：OmniShotCut 已经逐帧给全量边界，这两阶段是给 HSV 曲线补刀的，再用只会重复加刀。
@@ -98,7 +148,9 @@ export async function hybridScan({
 ## 5. 验收（必须真跑，写进报告）
 
 1. `node scripts/check-syntax.mjs` 全绿。
-2. `node --test`（`test/` 下现有用例）全绿。
+2. `node --test`（`test/` 下现有用例）全绿 —— 含 `test/detectors.test.mjs`（注册表不变量：
+   每个 id 都能被 `getDetector` 解析、`DETECTOR_IDS` 与表一致、`bypassStages` 只用真有的阶段名、
+   `pipeline.js` 里没有按后端名分叉的字符串比较）。
 3. 用夹具 `01-hardcut / 04-flash / 07-fastcut / 02b-dissolve1s` 跑 `bin/storyboard.mjs`：
    - `--detector hsv` 与 `--detector omnishotcut` 都必须**正常出图 + 出清单**；
    - 后者清单里出现 `grad:` 行；

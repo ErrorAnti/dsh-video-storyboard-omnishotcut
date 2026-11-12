@@ -74,8 +74,8 @@ export function configuredSection(data, key) {
  * 桌面版宿主读不到 `setx` 设的变量，文件是更可靠的那一层，但 CI / 一次性实验要能临时压过它。
  */
 
-/** `hsv` | `omnishotcut` —— 认得的后端 id。 */
-export const DETECTOR_IDS = Object.freeze(['hsv', 'omnishotcut']);
+/** `hsv` | `omnishotcut` | … —— 认得的后端 id 从**注册表**推出来（`detectors/index.js`）。 */
+export { DETECTOR_IDS } from './detectors/index.js';
 
 /** 后端的四个开关对应的环境变量名（doctor 报错时要照着念给用户）。 */
 export const DETECTOR_ENV = Object.freeze({

@@ -8,6 +8,13 @@
  * storyboard 链路的逐帧分数、指纹、亮度均值仍然由 HSV 扫描（`scan.js`）给 ——
  * 两套东西必须在同一个进程树里对齐时间轴，所以桥的 stdout 只有一行、单位只有秒。
  *
+ * ## 注册表接口
+ *
+ * `detectors/omnishotcut.js` 这个条目只认本文件末尾的三个函数：
+ * `resolve(cfg)`（配置校验，抛不回退）、`scan(opts)`（= hybridScan 加壳）、
+ * `doctorChecks(ctx)`（自检三项，依赖注入，不起进程也能测）。
+ * `hybridScan` 仍然是 `scan` 的内核，直接调用照旧可用。
+ *
  * ## 注入点
  *
  * - `exec`：跑子进程的实现，默认 `node:child_process.spawn`（`windowsHide: true`，
@@ -387,6 +394,9 @@ export async function hybridScan(opts = {}) {
     input, fps, start = 0, end, hsvScan,
     python, bridge, ckpt, signal, timeoutMs = 600000,
     mode = 'default', overlap = 10, exec = null,
+    // 切点最小间隔：注册表（`detectors/index.js` 的 `minGap`）从这里喂进来的就是 0.08s，
+    // 直接调用时缺省值仍是契约 §2.1 的那个常数 —— 两条路拿到的是同一个数。
+    minGap = OSM_MIN_GAP,
     // 调用方可能把整块 pipeline 配置丢进来：这两个不是 scanShots 的参数，剔掉
     detector: _detector, omnishotcut: osmCfg,
     ...hsvOpts
@@ -423,7 +433,7 @@ export async function hybridScan(opts = {}) {
   return {
     ...hsv,
     // 契约 §2.1：cuts 取 OmniShotCut 的（覆盖 hsv 的），排序去重
-    cuts: fillCutsScore(dedupeCuts(osm.cuts, OSM_MIN_GAP), hsv.stats),
+    cuts: fillCutsScore(dedupeCuts(osm.cuts, minGap), hsv.stats),
     scoring: { ...(hsv.scoring || {}), detector: OSM_DETECTOR_ID, cutSource: 'omnishotcut' },
     transitions: osm.transitions,
     osm: { ms: osm.ms, shots: osm.shots, fps: osm.fps },
@@ -456,4 +466,172 @@ export function fillCutsScore(cuts, stats, halfWindowSec = 0.12) {
     const score = best ?? nearest?.sc ?? 0;
     return { ...c, score: +Number(score).toFixed(2) };
   });
+}
+
+/* ================================================================ 注册表接口 ----
+ * 注册表（`detectors/index.js`）只认三个函数：`resolve` / `scan` / `doctorChecks`。
+ * 这三段以前散在 `pipeline.js`（配置校验）与 `bin/doctor.mjs`（自检）里，
+ * 现在收回到**知道这个后端细节的那一个文件**——接第三个模型时不用碰 pipeline。
+ *
+ * 三个函数都只做"这个后端自己的事"，pipeline 不再出现任何 `=== 'omnishotcut'`。
+ */
+
+/**
+ * 配置解析 + 校验。**抛，不回退。**
+ *
+ * 为什么必须抛：静默退回 hsv 会产出"看起来成功、但 cuts 全是另一个后端算的"结果 ——
+ * 清单、缓存、下游档位都会照着它走，而没人能看出换了后端。宁可当场失败。
+ *
+ * 两种失败分开报：连路径都没配（`osm-not-configured`）与配了但文件不在
+ * （`osm-bridge-missing`）是两件不同的事，用户的下一步也完全不同（写配置 vs 修路径）。
+ *
+ * @param {{omnishotcut: object, configPath?: string}} cfg `resolveDetectorConfig()` 的返回值
+ * @returns {{python: string, bridge: string, ckpt: string, source: object}}
+ */
+export function resolve(cfg) {
+  const osm = cfg?.omnishotcut ?? {};
+  const where = cfg?.configPath ?? '~/.dsh/video.json';
+  const missing = [...(osm.python ? [] : ['python']), ...(osm.ckpt ? [] : ['ckpt'])];
+  if (missing.length > 0) {
+    const err = new Error(
+      `detector 'omnishotcut' needs ${missing.join(' + ')}: write them in ${where} `
+      + '("omnishotcut": { "python": ..., "ckpt": ... }) or set DSH_OSM_PYTHON / DSH_OSM_CKPT. '
+      + 'Not falling back to hsv — that would silently hand back HSV cuts under another name.',
+    );
+    err.code = 'osm-not-configured';
+    err.missing = missing;
+    err.detector = 'omnishotcut';
+    err.configPath = where;
+    throw err;
+  }
+  if (!osm.bridgeExists) {
+    const err = new Error(
+      `detector 'omnishotcut' needs the Python bridge, but ${osm.bridge} does not exist. `
+      + 'Point "omnishotcut.bridge" (or DSH_OSM_BRIDGE) at src/storyboard/omnishotcut-bridge.py.',
+    );
+    err.code = 'osm-bridge-missing';
+    err.bridge = osm.bridge;
+    err.detector = 'omnishotcut';
+    throw err;
+  }
+  return { python: osm.python, bridge: osm.bridge, ckpt: osm.ckpt, source: osm.source };
+}
+
+/**
+ * 扫描：HSV 给曲线（`opts.curve`），OmniShotCut 给切点，`hybridScan` 负责把两者对齐。
+ *
+ * `opts.env` 是 `resolve()` 的返回值；`opts.curve` 是 pipeline 造的"跑一遍 HSV"回调
+ * （它同时把 means / prints 留给 pipeline，那些字段等级链下游还要用）。
+ * 其余键（`exec` / `signal` / `timeoutMs`）原样透传，测试可以塞假 exec 而不起 Python。
+ *
+ * @returns {Promise<object>} 与 `scanShots()` 同形，`cuts` 被换成后端的，外加 `transitions` / `osm`
+ */
+export async function scan(opts = {}) {
+  const { env = {}, curve, minGap, ...rest } = opts;
+  return hybridScan({
+    ...rest,
+    ...(Number(minGap) > 0 ? { minGap: Number(minGap) } : {}),
+    hsvScan: curve,
+    python: env.python, bridge: env.bridge, ckpt: env.ckpt,
+  });
+}
+
+/** 权重体积地板：几十 KB 的占位文件 / Git LFS 指针不该等到第一次推理才炸。 */
+export const MIN_CKPT_BYTES = 100 * 1024 * 1024;
+
+/** doctor 里那条 import 探针 —— 与 `findPython` 同一判据：光"能执行"不算数。 */
+const IMPORT_PROBE = 'import omnishotcut,sys;print(getattr(omnishotcut,"__version__","?"));'
+  + 'print(sys.version.split()[0])';
+
+/**
+ * 自检项（`bin/doctor.mjs` 只负责打印，判断都在这儿）。
+ *
+ * 返回 `[{name, ok, detail?, lines?, quiet?, fatal?}]`：
+ * - `detail` 是 ✅/❌ 后面那句话，`lines` 是原样打印的追加行（箭头提示自带缩进）；
+ * - `quiet: true` 表示"只有 lines，没有 ✅/❌"（配置来源那一行就是这种）；
+ * - `fatal: false` 表示不算硬伤（默认 `ok:false` 就算）。
+ *
+ * 依赖全部注入：`run(bin, args) -> {code, stdout, stderr}`、`stat(p) -> stat|null`。
+ * 所以这个函数不起进程也能测。
+ */
+export async function doctorChecks({ config, sourceText, run, stat } = {}) {
+  const osm = config?.omnishotcut ?? {};
+  const src = sourceText ?? config?.source ?? '内置默认';
+  const out = [{
+    name: 'config-source',
+    ok: true,
+    quiet: true,
+    lines: [`     配置来源：${config?.configPath ?? '~/.dsh/video.json'}（detector: ${src}）`],
+  }];
+
+  // ---- python：要的那一个包必须真能 import 进来
+  if (!osm.python) {
+    out.push({
+      name: 'python', ok: false,
+      detail: '没配 python —— detector=omnishotcut 起不来（不会回退到 hsv）',
+      lines: [
+        '     → ~/.dsh/video.json 的 "omnishotcut.python" 指到装好 omnishotcut 的解释器，',
+        '       或设 DSH_OSM_PYTHON（Windows 例：D:/osm/.venv/Scripts/python.exe）',
+      ],
+    });
+  } else {
+    const r = await run(osm.python, ['-c', IMPORT_PROBE]);
+    if (r?.code === 0) {
+      const [ver = '?', pyVer = '?'] = String(r.stdout ?? '').trim().split(/\r?\n/);
+      out.push({ name: 'python', ok: true, detail: `python: ${osm.python} — import omnishotcut ${ver} (Python ${pyVer})` });
+    } else {
+      const why = String(r?.stderr || r?.stdout || '').trim().split(/\r?\n/).pop() ?? '';
+      out.push({
+        name: 'python', ok: false,
+        detail: `python 跑不起来或 import omnishotcut 失败：${osm.python}`,
+        lines: [
+          ...(why ? [`       ${why.slice(0, 160)}`] : []),
+          '     → 在那台解释器里装：pip install omnishotcut torch；',
+          '       若是 "No module named omnishotcut"，说明配的是另一个环境',
+        ],
+      });
+    }
+  }
+
+  // ---- 权重：要有，而且明显不对的（占位文件 / LFS 指针）要当场说
+  if (!osm.ckpt) {
+    out.push({
+      name: 'ckpt', ok: false,
+      detail: '没配 ckpt（权重）—— detector=omnishotcut 起不来（不会回退到 hsv）',
+      lines: ['     → "omnishotcut.ckpt" 指到权重文件，或设 DSH_OSM_CKPT'],
+    });
+  } else {
+    const st = await stat(osm.ckpt) ?? null;
+    if (!st) {
+      out.push({
+        name: 'ckpt', ok: false,
+        detail: `权重不存在：${osm.ckpt}`,
+        lines: ['     → 路径写错也会长这样（相对路径按**当前目录**解析，建议写绝对路径）'],
+      });
+    } else if (st.size <= MIN_CKPT_BYTES) {
+      out.push({
+        name: 'ckpt', ok: false,
+        detail: `权重太小：${osm.ckpt} 只有 ${(st.size / 1048576).toFixed(1)} MB（要 > 100 MB）`,
+        lines: ['     → 多半是没下完 / 下成了 Git LFS 指针文件，重下一次'],
+      });
+    } else {
+      out.push({ name: 'ckpt', ok: true, detail: `权重：${osm.ckpt} (${(st.size / 1048576).toFixed(0)} MB)` });
+    }
+  }
+
+  // ---- 桥脚本
+  if (osm.bridgeExists) {
+    out.push({ name: 'bridge', ok: true, detail: `Python 桥：${osm.bridge}` });
+  } else {
+    out.push({
+      name: 'bridge', ok: false,
+      detail: `Python 桥不在：${osm.bridge ?? '(未解析)'}`,
+      lines: [
+        '     → 用包里那份 src/storyboard/omnishotcut-bridge.py；',
+        '       自定义的位置写进 "omnishotcut.bridge" 或 DSH_OSM_BRIDGE',
+      ],
+    });
+  }
+
+  return out;
 }
