@@ -44,6 +44,7 @@ import { analyzeAudio, describeAudio, hasAudibleSamples } from './audio.js';
 import { alignCells, resolveAsrConfig } from './asr.js';
 import { resolveTranscript } from './transcript-pass.js';
 import { cacheKey, withCache } from './cache.js';
+import { DETECTOR_IDS, resolveDetectorConfig } from './user-config.js';
 import { pruneStorage } from './storage.js';
 import { saveCells } from './cells.js';
 import { ffmpegVersion, sha256File } from './provenance.js';
@@ -76,6 +77,47 @@ export const BURN_MODES = ['index', 'none'];
 // 这里 re-export 保持外部 import 路径不变（test/spike-fallback.test.mjs 就指着它）。
 export { shouldTakeSpikes } from './cuts.js';
 
+/**
+ * `detector: 'omnishotcut'` 的配置校验（契约 §3）。**抛，不回退。**
+ *
+ * 为什么必须抛：静默退回 hsv 会产出"看起来成功、但 cuts 全是另一个后端算的"结果 ——
+ * 清单、缓存、下游档位都会照着它走，而没人能看出换了后端。宁可当场失败。
+ *
+ * 两种失败分开报：连路径都没配（`osm-not-configured`）与配了但文件不在
+ * （`osm-bridge-missing`）是两件不同的事，用户的下一步也完全不同（写配置 vs 修路径）。
+ *
+ * @param {{omnishotcut: object, configPath?: string}} cfg `resolveDetectorConfig()` 的返回值
+ * @returns {{python: string, bridge: string, ckpt: string, source: object}}
+ */
+export function requireOmniShotCut(cfg) {
+  const osm = cfg?.omnishotcut ?? {};
+  const where = cfg?.configPath ?? '~/.dsh/video.json';
+  const missing = [...(osm.python ? [] : ['python']), ...(osm.ckpt ? [] : ['ckpt'])];
+  if (missing.length > 0) {
+    const err = new Error(
+      `detector 'omnishotcut' needs ${missing.join(' + ')}: write them in ${where} `
+      + '("omnishotcut": { "python": ..., "ckpt": ... }) or set DSH_OSM_PYTHON / DSH_OSM_CKPT. '
+      + 'Not falling back to hsv — that would silently hand back HSV cuts under another name.',
+    );
+    err.code = 'osm-not-configured';
+    err.missing = missing;
+    err.detector = 'omnishotcut';
+    err.configPath = where;
+    throw err;
+  }
+  if (!osm.bridgeExists) {
+    const err = new Error(
+      `detector 'omnishotcut' needs the Python bridge, but ${osm.bridge} does not exist. `
+      + 'Point "omnishotcut.bridge" (or DSH_OSM_BRIDGE) at src/storyboard/omnishotcut-bridge.py.',
+    );
+    err.code = 'osm-bridge-missing';
+    err.bridge = osm.bridge;
+    err.detector = 'omnishotcut';
+    throw err;
+  }
+  return { python: osm.python, bridge: osm.bridge, ckpt: osm.ckpt, source: osm.source };
+}
+
 export async function runStoryboard(opts) {
   const {
     input: inputRaw,
@@ -95,6 +137,11 @@ export async function runStoryboard(opts) {
     // 刀数 +13%；BBC 11 集反过来，60 比 80 掉 3.2 个点。没有一个常数能两头讨好，
     // 所以交给调用方（模型/用户）按素材类型选，见 tool-spec 里的说明。
     cutFloor = null,
+    // 切点后端：`hsv`（默认，零依赖）| `omnishotcut`（OmniShotCut 给切点，HSV 仍给逐帧曲线）。
+    // 不传就按 ~/.dsh/video.json 的 `detector` 走，环境变量 DSH_VIDEO_DETECTOR 优先（见 user-config.js）。
+    detector = null,
+    // `{python, bridge, ckpt}` 的显式覆盖。优先级同样是 **显式 > 环境变量 > video.json**。
+    omnishotcut = null,
     // 取帧并发数：每路 ffmpeg 只解一帧，互不依赖。实测 154 帧（16 核 i9-12900HX）：
     // 4 路 9.65s / 8 路 6.58s / 12 路 5.68s / 16 路 5.56s / 24 路 6.44s（过了 16 就抢不到核）。
     // 取 0.75×核数：16 核 → 12，比 8 快 14%，又不像 24 那样把机械盘和内存带宽打满。
@@ -172,6 +219,22 @@ export async function runStoryboard(opts) {
     throw new RangeError(`strategy must be one of ${[AUTO_STRATEGY, ...Object.keys(STRATEGIES)].join(' / ')}`
       + ` (old names quality/balanced/saver/frugal/thrifty/ultra still accepted)`);
   }
+  // ---- 切点后端（hsv 默认；omnishotcut 要 python + 权重）
+  // **绝不静默回退**：`detector: 'omnishotcut'` 而配置不全时抛结构化错误（err.code='osm-not-configured'）。
+  // 退回 hsv 的代价是"看起来成功了，cuts 却全是另一个后端算的" —— 清单与缓存里都看不出来。
+  const detectorCfg = resolveDetectorConfig({ detector, omnishotcut });
+  const detectorId = detectorCfg.detector;
+  if (!DETECTOR_IDS.includes(detectorId)) {
+    // 配置里写错一个字母不能悄悄变成 hsv：那是"我明明设了 omnishotcut 怎么没生效"的另一半。
+    const err = new RangeError(
+      `detector must be one of ${DETECTOR_IDS.join(' / ')} (got "${detectorId}" from ${detectorCfg.source})`,
+    );
+    err.code = 'osm-unknown-detector';
+    throw err;
+  }
+  // 只在真要用的时候才校验：hsv 机器上没装 python / 没下权重是**正常**状态，不该报错。
+  const osm = detectorId === 'omnishotcut' ? requireOmniShotCut(detectorCfg) : null;
+
   // 扫描期最小间隔：调用方显式给了就用它，否则用策略自带的（只有"恭喜发财档"带 0.35）
   const capGap = Number(scanGap) > 0
     ? Number(scanGap)
@@ -266,6 +329,10 @@ export async function runStoryboard(opts) {
     // **门槛必须进键**：它直接决定 cuts。漏了就会出现"改了参数却拿到上一次结果的缓存" ——
     // minGap 踩过一模一样的坑（见 cacheKey 的注释）。
     cutFloor,
+    // **后端也必须进键**（契约 §3）：hsv 与 omnishotcut 的 cuts 是两个来源，
+    // 不加这两维就会出现"换了后端 / 换了权重，却命中旧缓存"。
+    detector: detectorId,
+    ckpt: osm?.ckpt ?? null,
   }) : null;
   let scanMeans = null;
   let scanPrints = null;
@@ -285,23 +352,51 @@ export async function runStoryboard(opts) {
       // 命中缓存时一行解码都不做，探测本身就是白花的 300ms。
       const hwaccel = await resolveHwaccel({ ffmpegPath, input });
       hwaccelUsed = hwaccel;
-      const s = await scanShots({
-        input, fps: info.fps, threshold, start: winStart, end: winStart + winDur,
-        minGap: capGap, ffmpegPath, hwaccel, onProgress,
-        // 运动补偿口径（见 scan.js 头注释与 docs/REFERENCES.md）：
-        // 短视频 69.8→74.4、纪录片 86.1→89.4；代价是每帧打分 0.04→0.155 ms（整段扫描 +5%）。
-        // 想回到旧口径：runStoryboard({ scanMode: 'abs' })。
-        scoreMode: scanMode,
-        ...(Number.isFinite(Number(cutFloor)) && Number(cutFloor) > 0
-          ? { minCutScore: Number(cutFloor) }
-          : {}),
-      });
-      scanMeans = s.means;
-      scanPrints = s.prints;
+      /**
+       * HSV 那一路（`scanShots`）。**两条后端共用这一个回调**：
+       *
+       * 逐帧分数曲线（`stats`/`means`/`prints`）、`threshold`、`degraded`、`summary`
+       * 全都只有它给 —— 积分补帧、闪光标签、极静检测全靠这些字段，
+       * 而 OmniShotCut 只给"边界在哪"这一件事（见 docs/omnishotcut-backend.md §0）。
+       */
+      const runHsvScan = async () => {
+        const s = await scanShots({
+          input, fps: info.fps, threshold, start: winStart, end: winStart + winDur,
+          minGap: capGap, ffmpegPath, hwaccel, onProgress,
+          // 运动补偿口径（见 scan.js 头注释与 docs/REFERENCES.md）：
+          // 短视频 69.8→74.4、纪录片 86.1→89.4；代价是每帧打分 0.04→0.155 ms（整段扫描 +5%）。
+          // 想回到旧口径：runStoryboard({ scanMode: 'abs' })。
+          scoreMode: scanMode,
+          ...(Number.isFinite(Number(cutFloor)) && Number(cutFloor) > 0
+            ? { minCutScore: Number(cutFloor) }
+            : {}),
+        });
+        scanMeans = s.means;
+        scanPrints = s.prints;
+        return s;
+      };
+      // **懒 import**：只要一次模块求值，就保证 hsv 路径（99% 的调用）根本不去碰
+      // omnishotcut.js —— 那个文件反过来依赖 python 相关的东西，没有理由让它进每一台机器。
+      const s = osm
+        ? await (await import('./omnishotcut.js')).hybridScan({
+          input, fps: info.fps, start: winStart, end: winStart + winDur,
+          // 必传：hybridScan 自己不做 HSV，它拿这个回调去要曲线（契约 §2.1）
+          hsvScan: runHsvScan,
+          python: osm.python, bridge: osm.bridge, ckpt: osm.ckpt,
+        })
+        : await runHsvScan();
       return {
         cuts: s.cuts, stats: s.stats, frames: s.frames,
         threshold: s.threshold, degraded: s.degraded, summary: s.summary,
         printPack: s.prints?.length ? packPrints(s.prints, info.fps) : null,
+        // 后端自己的东西只在真是那个后端时才写进条目：hsv 的缓存 JSON 一个字节都不多，
+        // 而 omnishotcut 的条目必须自带 transitions —— 否则第二次命中缓存就突然少一行 `grad:`。
+        ...(osm ? {
+          detector: detectorId,
+          ...(Array.isArray(s.transitions) && s.transitions.length
+            ? { transitions: s.transitions } : {}),
+          ...(s.osm ? { osm: s.osm } : {}),
+        } : {}),
       };
     }, { enabled: cache });
   if (scanPrints?.length) {
@@ -316,6 +411,17 @@ export async function runStoryboard(opts) {
   if (cache && !scan.cached && !precomputed) await pruneStorage();
   mark('scan');
 
+  /**
+   * 外部检测器的原始渐变转场（秒）：`[{from, to, label}]`。
+   *
+   * v1 里每段已经被**折叠成中点一刀**（见 omnishotcut.js），所以这里只留区间本身 ——
+   * 清单靠它说一句 `grad:`（契约 §4）。命中缓存时也带着它（写进了缓存条目），
+   * 否则第二次跑同一窗口会突然少一行，看起来像后端掉了。
+   */
+  const transitions = Array.isArray(scan.transitions) && scan.transitions.length
+    ? scan.transitions : null;
+  const osmInfo = scan.osm ?? null;
+
   if (isOwned()) keepAlive();
   let cuts = scan.cuts;
 
@@ -324,6 +430,11 @@ export async function runStoryboard(opts) {
   // 这里只负责把上下文喂进去 —— 别在本函数里再加"改 cuts 的步骤"。
   const cutChain = resolveCuts({
     scan, scanMode, capGap, strategy, refineBursts, textOnly, precomputed,
+    // **omnishotcut 关掉补刀的两阶段**（契约 §3）：它已经逐帧给全量边界，
+    // 而阶段 1/2 是"拿分数曲线猜哪里还漏了一刀"—— 再用只会在同一处重复加刀。
+    // 阶段 3（丐中丐合并）与 4（打标签）保持开启：那两件事与切点来源无关。
+    allowStillSpikes: !osm,
+    allowRefineBursts: !osm,
     fps: info.fps, winStart, winDur,
     prints: scanPrints, means: scanMeans,
   });
@@ -986,6 +1097,8 @@ export async function runStoryboard(opts) {
       cells: [],
       ...(scan.degraded ? { degraded: scan.degraded } : {}),
       ...(refinedBursts.length ? { refinedBursts } : {}),
+      ...(transitions ? { transitions } : {}),
+      ...(osmInfo ? { osm: osmInfo } : {}),
       ...(sourceInfo ? { source: sourceInfo } : {}),
     };
   }
@@ -1026,6 +1139,8 @@ export async function runStoryboard(opts) {
       textOnly: true,
       ...(sourceInfo ? { source: sourceInfo } : {}),
       ...(refinedBursts.length ? { refinedBursts } : {}),
+      ...(transitions ? { transitions } : {}),
+      ...(osmInfo ? { osm: osmInfo } : {}),
       totalDuration: +segs.reduce((n, s) => n + (s.to - s.from), 0).toFixed(3),
     };
   }
@@ -1225,6 +1340,9 @@ export async function runStoryboard(opts) {
     cached: Boolean(scan.cached),
     ...(sourceInfo ? { source: sourceInfo } : {}),
     ...(refinedBursts.length ? { refinedBursts } : {}),
+    // 只有 omnishotcut 才有的两项（hsv 路径上一个键都不多出来）
+    ...(transitions ? { transitions } : {}),
+    ...(osmInfo ? { osm: osmInfo } : {}),
     ...(fallbacks > 0 ? { frameFallbacks: fallbacks } : {}),
     audio: stripAudio
       ? { ...stripAudio, summary: describeAudio(stripAudio, winDur) }

@@ -339,6 +339,34 @@ export function formatTimeline(rows, { title = 'batch timeline' } = {}) {
 }
 
 /**
+ * 一行说清"这次有多少渐变转场、各是什么"（契约 §4）。
+ *
+ * 为什么需要它：`omnishotcut` 后端会把每段叠化/淡入淡出**折叠成中点一刀**，
+ * 于是清单上的 `cuts=N` 把"渐变"和"硬切"混成了一个数。模型据此讲节奏时，
+ * 会把一段 1 秒的叠化读成"两个镜头"，而实际画面是一路融过去的。
+ * 一行计数足够纠正它 —— 不必为每段转场各开一行（清单每一行都在每轮会话里重发）。
+ *
+ * @param {object} result runStoryboard 的返回值
+ * @returns {string|null} 没有转场时返回 null（hsv 路径永远走这一支，一个字符都不多）
+ */
+export function formatTransitionLine(result) {
+  const list = Array.isArray(result?.transitions) ? result.transitions : [];
+  if (list.length === 0) return null;
+  const counts = new Map();
+  for (const tr of list) {
+    const raw = String(tr?.label ?? '').trim();
+    // 没标签的单列一档：混进任何一边都会让数字对不上（总数 ≠ 各档之和）
+    const label = raw ? raw.toLowerCase() : 'unlabeled';
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  // 多的在前；同样多按名字排，保证两次跑同一支片子输出一致（缓存对比时能逐字比较）
+  const parts = [...counts.entries()]
+    .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
+    .map(([label, n]) => `${label} ${n}`);
+  return `grad: ${list.length} transition(s) — ${parts.join(' / ')}`;
+}
+
+/**
  * 一行说清"这次是怎么排的"：策略、帧数、张数、档位分布、几何、代价。
  *
  * 这一行存在的意义是**可复核**：模型看到 1/8 档有 30 帧，就知道那一段被切成小格子了；
@@ -650,6 +678,9 @@ export function formatManifest(result, {
   }
   const planLine = formatPlanLine(result.plan);
   if (planLine) lines.push(planLine);
+  // 渐变转场：紧跟在 plan 行后面，**一行**（契约 §4）。没有转场时整行不出现。
+  const gradLine = formatTransitionLine(result);
+  if (gradLine) lines.push(gradLine);
   // 预算落进地板档（<544²）时必须说明：画得更小一分钱不省，只会更糊。
   if (result.plan?.budgetRaisedFrom) {
     const used = result.plan.budget;
@@ -990,6 +1021,32 @@ export function formatManifest(result, {
 
   let used = lines.join('\n').length;
   let stoppedAt = null;
+  /**
+   * 哪几格的边界正好落在某段渐变转场的**中点**（契约 §4）。
+   *
+   * 判定两条腿：中点撞上某个切点（转场被折叠的那一刀就在那里）→ 取"从这一刀开始"的那格；
+   * 边界被档位挪过、中点落在格内部 → 取包含它的那格。都没有就不标 ——
+   * 标错了比不标更糟：模型会以为这一格是渐变，其实它是硬切。
+   */
+  const gradCells = new Set();
+  {
+    const mids = (Array.isArray(result.transitions) ? result.transitions : [])
+      .map((tr) => (Number(tr?.from) + Number(tr?.to)) / 2)
+      .filter((v) => Number.isFinite(v));
+    for (const mid of mids) {
+      let best = null;
+      for (const c of picked) {
+        const d = Math.min(Math.abs(c.t_start - mid), Math.abs(c.t_end - mid));
+        if (d <= 0.06 && (!best || d < best.d)) best = { i: c.i, d };
+      }
+      if (!best) {
+        for (const c of picked) {
+          if (c.t_start <= mid && mid <= c.t_end) { best = { i: c.i, d: Infinity }; break; }
+        }
+      }
+      if (best) gradCells.add(best.i);
+    }
+  }
   for (const c of picked) {
     // 可变网格没有"第几行第几列"这回事，只有"第几张图的第几格"。
     const where = result.sheets.length > 1 ? ` (image ${c.sheet})` : '';
@@ -1006,9 +1063,11 @@ export function formatManifest(result, {
       : (Number.isFinite(c.tier) && uniformTier === null ? `  k=${c.tier} (1/${c.tier})` : '');
     // 积分采样点：图上没编号，这里标一下，否则模型数格子会对不上（编号会跳号）
     const markTag = c.via === 'mark' ? '  [integral]' : '';
+    // 这一格的边界是某段渐变的中点（叠化的中间那一刀）：不标的话模型会当成硬切
+    const gradTag = gradCells.has(c.i) ? '  (transition)' : '';
     const head = `cell ${c.i}${where} = ${tc(c.t_start)}-${tc(c.t_end)}` +
       (showFrame ? ` frame@${tc(c.t_frame)}` : '') +
-      (c.cuts ? `  cuts ${c.cuts}` : '') + tierTag + markTag;
+      (c.cuts ? `  cuts ${c.cuts}` : '') + tierTag + markTag + gradTag;
     const body = ref ? `${head}  → ${ref}`
       : (dupOf.has(c.i) ? `${head}  → same as cell ${dupOf.get(c.i)}`
         : (text ? `${head}\n    ${text}` : head));

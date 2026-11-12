@@ -11,6 +11,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -65,10 +66,55 @@ export function cacheDir(env = process.env) {
 }
 
 /**
- * 缓存键：路径 + 大小 + mtime + 窗口 + 阈值模式 + 切点门槛。
+ * 权重文件的指纹 —— 进 cacheKey 的那一半（契约 §3）。
+ *
+ * 为什么必须进键：换了 ckpt、甚至换了一份同名同尺寸的权重，切点就完全不同；
+ * 键里没有它就会出现"换了后端/权重，却命中上一次的旧缓存"，而且清单上看不出来。
+ *
+ * 为什么要 sha256 而不是只取 mtime：权重常被 rsync / 云盘同步原地覆盖，
+ * mtime 有时不变、有时同一秒（NTFS 精度）。sha256 是唯一说得准的那个。
+ * 读不了（权限 / 被占用）就退回 `mtime+size` —— 弱一点，但绝不因为读不到就不进键。
+ *
+ * 100 MB+ 的文件每个新进程读一遍约 0.2–0.4s；按 `路径+size+mtime` 记忆，同进程内只算一次。
+ */
+const CKPT_MEMO = new Map();
+
+export async function ckptFingerprint(path) {
+  if (!path) return '';
+  let st;
+  try {
+    st = await stat(path);
+  } catch {
+    // 路径写错也要和"没配"区分开：'missing' 是键的一部分（换成正确路径自然会重扫）
+    return 'missing';
+  }
+  const memoKey = `${path}|${st.size}|${Math.round(st.mtimeMs)}`;
+  const hit = CKPT_MEMO.get(memoKey);
+  if (hit) return hit;
+  let value;
+  try {
+    const hash = createHash('sha256');
+    for await (const chunk of createReadStream(path)) hash.update(chunk);
+    value = `sha256:${hash.digest('hex').slice(0, 16)}`;
+  } catch {
+    value = `mt:${st.size}:${Math.round(st.mtimeMs)}`;
+  }
+  CKPT_MEMO.set(memoKey, value);
+  return value;
+}
+
+/** 清掉指纹记忆（测试用） */
+export function resetCkptMemo() {
+  CKPT_MEMO.clear();
+}
+
+/**
+ * 缓存键：路径 + 大小 + mtime + 窗口 + 阈值模式 + 切点门槛 + **检测器后端**。
  * 不用文件内容 hash —— 2GB 的文件读一遍比重新扫描还慢。
  */
-export async function cacheKey({ input, start, end, threshold, minGap, cutFloor }) {
+export async function cacheKey({
+  input, start, end, threshold, minGap, cutFloor, detector = 'hsv', ckpt = null,
+}) {
   let size = 0;
   let mtime = 0;
   try {
@@ -81,8 +127,12 @@ export async function cacheKey({ input, start, end, threshold, minGap, cutFloor 
   // **`minGap` 必须进键**：它改变切点判定（近邻合并），漏了就会出现"改参数却拿到上一次结果的缓存"。
   // 实测踩过：把阈值下限从 12 调到 20，刀数反而变多 —— 拿回来的是旧配置的 cuts。
   // **`cutFloor` 同理**：它是切点判定下限，改了它 cuts 完全不同。
+  // **`detector` 也同理**（契约 §3）：hsv 与 omnishotcut 的 cuts 是两个来源，
+  // 不加这一维就会出现"换了后端却命中旧缓存" —— 清单照旧，刀却全是上一次的。
+  const ckptFp = await ckptFingerprint(ckpt);
   const raw = [CACHE_VERSION, input, size, mtime, start ?? 0, end ?? 'eof',
-    String(threshold), String(minGap ?? 'def'), String(cutFloor ?? 'def')].join('|');
+    String(threshold), String(minGap ?? 'def'), String(cutFloor ?? 'def'),
+    String(detector || 'hsv'), ckptFp].join('|');
   return createHash('sha1').update(raw).digest('hex').slice(0, 20);
 }
 

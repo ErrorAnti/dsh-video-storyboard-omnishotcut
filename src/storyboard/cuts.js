@@ -18,6 +18,11 @@
  *
  * **新增"加刀"或"删刀"的阶段，只能排在 3 之后、4 之前。**
  * 排在 1~3 之前会抬高它们的门槛；排在 4 之后会丢掉类型标签。
+ *
+ * 阶段 1 / 2 是给**逐帧分数曲线**补刀的（HSV 看得见曲线、看不见 0.35s 以下的刀）。
+ * 换成就给了全量边界的外部后端（`detector: 'omnishotcut'`，见 pipeline.js）时，
+ * 这两阶段再用只会把同一刀重复加上去，所以给它们各留一个开关：
+ * `allowStillSpikes` / `allowRefineBursts`。**默认都是 true** —— 不传就是现在这套行为。
  */
 
 import {
@@ -73,6 +78,8 @@ export function shouldTakeSpikes({
  * @param {number} o.capGap         扫描期最小间隔（0 = 不合并）
  * @param {string} o.strategy       档位名（丐中丐要读 fitOneSheet）
  * @param {boolean} o.refineBursts  是否跑爆点细扫
+ * @param {boolean} [o.allowStillSpikes]   阶段 1 的开关（默认 true，外部检测器要求关掉）
+ * @param {boolean} [o.allowRefineBursts]  阶段 2 的开关（默认 true，外部检测器要求关掉）
  * @param {boolean} o.textOnly      纯文本模式：跳过所有图像相关的阶段
  * @param {boolean} o.precomputed   复用已有扫描结果：**原样返回**，一个阶段都不跑
  * @param {number} o.fps
@@ -84,6 +91,7 @@ export function shouldTakeSpikes({
  */
 export function resolveCuts({
   scan, scanMode = 'mc', capGap = 0, strategy, refineBursts = true,
+  allowStillSpikes = true, allowRefineBursts = true,
   textOnly = false, precomputed = null, fps, winStart, winDur,
   prints = null, means = null,
 }) {
@@ -93,7 +101,7 @@ export function resolveCuts({
   if (precomputed) return { cuts, refinedBursts: [], trace };
 
   // ---- 1. 极静素材补刀：绝对阈值会漏掉"只改了几个像素"的翻页
-  if ((scan.stats?.length ?? 0) > 20) {
+  if (allowStillSpikes && (scan.stats?.length ?? 0) > 20) {
     const perSec = cuts.length / Math.max(1, winDur);
     if (perSec < STILL_PER_SEC) {
       const minAbs = STILL_MIN_ABS[scanMode] ?? STILL_MIN_ABS.abs;
@@ -110,7 +118,7 @@ export function resolveCuts({
 
   // ---- 2. 爆点细扫：粗扫看不见 0.35s 以下的刀
   let refinedBursts = [];
-  if (refineBursts && !textOnly) {
+  if (refineBursts && allowRefineBursts && !textOnly) {
     const r = refineCutsByWindow({
       stats: scan.stats, coarseCuts: cuts, fps, winStart, winDur,
       coarseThreshold: scan.threshold ?? 0,
