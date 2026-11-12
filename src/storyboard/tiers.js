@@ -702,7 +702,7 @@ export function integralMarks({
  * @returns {Array<{from:number,to:number,t:number,cut:boolean,via:'cut'|'mark'|'start'}>}
  */
 export function framesFromBounds({
-  duration, cuts = [], marks = [], maxFrames = 0, minLen = 0.08, start = 0,
+  duration, cuts = [], marks = [], transitions = [], maxFrames = 0, minLen = 0.08, start = 0,
 } = {}) {
   if (!(duration > 0)) throw new RangeError(`duration must be > 0, got ${duration}`);
   const rawCap = Number(maxFrames);
@@ -710,7 +710,16 @@ export function framesFromBounds({
   const cap = Number.isFinite(rawCap) && rawCap > 0 ? Math.max(1, Math.round(rawCap)) : Infinity;
   const cutSet = new Set(cuts.map((c) => +Number(c).toFixed(3)));
   const markSet = new Set(marks.map((c) => +Number(c).toFixed(3)));
-  const all = [...cuts, ...marks]
+  // 转场区间：**两个边界都成为段边界**，于是转场自己占一段（而不是被折叠成一个点）。
+  // 键是起点（三位小数），值是终点 —— 建段时据此把这一段标成 via:'transition'。
+  const transStarts = new Map();
+  for (const tr of transitions ?? []) {
+    const a = +Number(tr?.from).toFixed(3);
+    const b = +Number(tr?.to).toFixed(3);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || !(b > a)) continue;
+    transStarts.set(a, b);
+  }
+  const all = [...cuts, ...marks, ...transStarts.keys(), ...transStarts.values()]
     .filter((t) => Number.isFinite(t) && t > start && t < start + duration)
     .sort((a, b) => a - b);
 
@@ -726,11 +735,12 @@ export function framesFromBounds({
     const to = bounds[i + 1];
     if (!(to > from)) continue;
     const key = +from.toFixed(3);
+    const isTransition = transStarts.has(key) && Math.abs(transStarts.get(key) - to) < 1.5 * minLen;
     segs.push({
       from, to,
       t: (from + to) / 2,
       cut: cutSet.has(key),
-      via: cutSet.has(key) ? 'cut' : (markSet.has(key) ? 'mark' : 'start'),
+      via: isTransition ? 'transition' : (cutSet.has(key) ? 'cut' : (markSet.has(key) ? 'mark' : 'start')),
     });
   }
   if (segs.length === 0) {
@@ -861,6 +871,26 @@ function evenSplit(s, k) {
  * 加在 `applyStrategy` **之前**：策略是全局偏向（quality 全体升一档），
  * 假切点的额外加成是内容驱动的，两者叠起来才能让"运动段"在任何策略下都比周围细。
  */
+/**
+ * **转场段的最小档位**（档位越大格子越小）。
+ *
+ * 一段 1 秒的叠化本身没有"内容"，它的作用只是告诉模型"这里换场了"：
+ * 给它一个 1/4 的小格就够，不要让它和前后镜头抢面积；但如果周围的切点密度
+ * 已经把它推到更细（6/7/8 档），就保留更细的那个 —— 所以是 `max`，不是覆盖。
+ *
+ * 只对 `via === 'transition'` 的段生效（转场边界由后端给出，见 `framesFromBounds`）。
+ */
+export const TRANSITION_TIER = 4;
+
+export function applyTransitionBoost(tiers, segs, tier = TRANSITION_TIER) {
+  return tiers.map((t, i) => {
+    const n = Number(t);
+    if (n === 0) return 0;                     // 自由尺寸的补位帧不参与
+    if (segs[i]?.via !== 'transition') return t;
+    return Math.max(TIER_MIN, Math.min(TIER_MAX, Math.max(Number.isFinite(n) ? n : TIER_MIN, tier)));
+  });
+}
+
 export const MARK_BOOST = 3;
 
 export function applyMarkBoost(tiers, segs, boost = MARK_BOOST) {

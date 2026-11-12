@@ -108,6 +108,22 @@ export async function hybridScan({
 ## 6. 边界
 
 - 不改 `bin/storyboard.mjs` 的参数表（内部走配置文件/环境变量即可；CLI flag 可选，不是必须）。
-- 不改 `tiers.js`（v1 不引入"转场段占独立格子"的结构改动）。
+- **v2 起 `tiers.js` 参与**：`framesFromBounds` 接受 `transitions`，转场自己占一段（`via:'transition'`），
+  档位由 `applyTransitionBoost` 兜到至少 1/4（见 §7）。除此之外不动 `tiers.js`。
 - 不打包权重、不写死绝对路径；权重路径由配置/环境给出。
 - 不引入 npm 新依赖（Node 侧只用 `node:child_process`）。
+
+## 7. v2：转场段占独立小格（已落地）
+
+v1 把转场折叠成一个中点切点，转场宽度只进了清单文字。v2 把它变成结构：
+
+| 位置 | 行为 |
+|---|---|
+| `tiers.framesFromBounds({transitions})` | 转场的 `from`/`to` 都成为段边界，段标签 `via:'transition'` |
+| `pipeline` 的 `segCuts` | **丢掉落在转场内部的中点切点**（否则会把转场劈成两半、标签永远打不上） |
+| `tiers.applyTransitionBoost(tiers, segs)` | 转场段档位 `max(原档位, 4)` —— 至少 1/4，但周围更细时保持更细 |
+| `pipeline.fillGaps` | **不动含转场段的图**（它会重建分段、把 `via` 抹掉）；代价是那张图填充率低一点 |
+| 密度曲线 `levelCurve` | 仍只用中点切点，**不吃**转场边界（否则一段转场会把左右镜头一起压小） |
+
+实测（`02b-dissolve1s.mp4`，6 镜头 / 5 段 1 s 叠化）：
+v1 = 5 帧（4 格）→ v2 = **11 帧 / 1 张 / 档位 1/2×1 1/3×5 1/4×5，填充 84.4%**。

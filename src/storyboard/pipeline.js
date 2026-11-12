@@ -33,7 +33,7 @@ import { rememberSegments } from './locate.js';
 import { isOwned, keepAlive, scheduleStop } from './asr-lifecycle.js';
 import {
   AUTO_CANDIDATES, AUTO_STRATEGY, BIN_COST, DEFAULT_STRATEGY, MARK_BOOST, READABILITY_ORDER, STRATEGIES,
-  applyMarkBoost, applyStrategy, applyTierMap, autoSheetCap, shouldForceSheetCap,
+  applyMarkBoost, applyStrategy, applyTransitionBoost, applyTierMap, autoSheetCap, shouldForceSheetCap,
   fitCanvas, pickAutoStrategy, resolveStrategy,
   framesFromBounds, integralMarks, levelAt, levelCurve, readabilityOf, tierHistogram, thresholdsFor,
   needsTimeFloor, splitStaticShots, STATIC_SHOT_MAX_FRAMES, STATIC_SHOT_MAX_SEC,
@@ -478,6 +478,24 @@ export async function runStoryboard(opts) {
 
   // ---- 1) 积分取帧（假切点）：只在**真切点之间**补，真切点自己已经是边界
   const absCuts = cuts.map((c) => c.t);
+  // 转场区间（绝对秒）：后端（目前是 OmniShotCut）给的 [from,to] + 类型标签。
+  // 只做窗口裁剪与合法性过滤；**不参与切点密度曲线**（curve 仍用 absCuts），
+  // 否则一段转场会连带把左右两个镜头的档位也压小。
+  const relTransitions = (Array.isArray(scan.transitions) ? scan.transitions : [])
+    .map((tr) => ({
+      from: Math.max(winStart, Number(tr?.from)),
+      to: Math.min(winStart + winDur, Number(tr?.to)),
+      label: tr?.label ?? null,
+    }))
+    .filter((tr) => Number.isFinite(tr.from) && Number.isFinite(tr.to) && tr.to - tr.from > 0.05);
+
+  // **落在转场区间内部的中点切点要丢掉**：转场自己的两个边界已经是段边界，
+  // 再留中点只会把转场劈成两半（实测：2.042–3.0 的叠化被 2.52 的中点切成两段，
+  // 两段都不匹配转场区间，`via:'transition'` 永远标不上）。
+  // 注意密度曲线仍然用 absCuts —— 那是"这个位置有几个切点事件"，语义不同。
+  const segCuts = relTransitions.length
+    ? absCuts.filter((t) => !relTransitions.some((tr) => t > tr.from + 1e-6 && t < tr.to - 1e-6))
+    : absCuts;
   // 乞丐档不要假切点：那些帧是"画面一直在变"补出来的，省钱的档位不该再为它多取帧
   const wantIntegral = integral && !STRATEGIES[strategy]?.noIntegral;
   const sampleMarks = wantIntegral && scan.stats?.length
@@ -542,7 +560,8 @@ export async function runStoryboard(opts) {
 
   const build = (cap) => {
     let sg = framesFromBounds({
-      duration: winDur, start: winStart, cuts: absCuts, marks: sampleMarks, maxFrames: cap,
+      duration: winDur, start: winStart, cuts: segCuts, marks: sampleMarks,
+      transitions: relTransitions, maxFrames: cap,
     });
     if (Number(minFrames) > 1) sg = ensureMinFrames(sg, Math.min(24, Math.round(Number(minFrames))));
     /**
@@ -565,6 +584,13 @@ export async function runStoryboard(opts) {
     const base = sg.map((s) => levelAt(curve, s.t - winStart));
     const raw = applyMarkBoost(base, sg);
     let tr = applyStrategy(raw, activeStrategy);
+    // 转场段给最小档位（1/4）：它没有内容，只负责说明"这里换场了"。
+    // 放在 applyStrategy 之后（策略是全局偏向，不该把转场段放大）、applyTierMap 之前（调用方覆盖优先）。
+    tr = applyTransitionBoost(tr, sg);
+    if (process.env.DSH_DEBUG_TRANSITIONS) {
+      console.error('[dbg] segs', sg.map((s) => `${s.from.toFixed(2)}-${s.to.toFixed(2)}:${s.via}`).join(' '));
+      console.error('[dbg] tiers', tr.join(','), '| transitions', relTransitions.length);
+    }
     tr = applyTierMap(tr, tierMap);
     if (uniformTier === 'auto') {
       // zoom 的语义是"一张图里 n 个格子看清楚"，不是"按内容密度分配大小"：
@@ -725,6 +751,9 @@ export async function runStoryboard(opts) {
       let worst = null;
       for (const [bin, area] of fills) if (!worst || area < worst.area) worst = { bin, area };
       if (!worst || worst.area >= FILL_TARGET) break;
+      // **补位不能动转场段**：fillGaps 会重建这一格里的分段（via 全被抹成 'start'），
+      // 于是"这一段是转场"就没法再传给档位系统。代价只是这张图填充率低一点。
+      if (cur.plan.cells.some((c) => c.bin === worst.bin && cur.segs[c.seq]?.via === 'transition')) break;
 
       // **先试"减帧"**：n 个正方形铺不满时，减到最近的较小平方数反而能 100%，
       // 而且格子放大一档（6 个 1/3 → 4 个 1/2），画面更清楚。这比"切几刀补到较大平方数"
@@ -1065,7 +1094,8 @@ export async function runStoryboard(opts) {
     // 实测一条 191 刀的素材，真实是 full 59 张 / standard 10 张 / compact 9 张，
     // 却全被报成 "1 image"，模型据此选档等于闭眼开车。
     const freeSegs = framesFromBounds({
-      duration: winDur, start: winStart, cuts: absCuts, marks: sampleMarks,
+      duration: winDur, start: winStart, cuts: segCuts, marks: sampleMarks,
+      transitions: relTransitions,
     });
     const freeRaw = applyMarkBoost(freeSegs.map((s) => levelAt(curve, s.t - winStart)), freeSegs);
     const variants = [...AUTO_CANDIDATES, 'skim'].map((name) => {
