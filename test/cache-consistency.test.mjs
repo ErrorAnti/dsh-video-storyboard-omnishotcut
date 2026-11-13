@@ -266,3 +266,23 @@ test('反例护栏：打标签的帧率来自 printFps（读 cuts.js / pipeline.
   assert.ok(rcAt > 0, 'pipeline.js 里找不到 resolveCuts 调用点');
   has(pipe.slice(rcAt, rcAt + 1200), /printFps/, 'resolveCuts 的入参里必须带 printFps');
 });
+
+test('缓存一致性：快剪素材（07-fastcut）miss→hit 的切点与标签必须一致', async () => {
+  // 这条是**实测抓到过的**漂移：快剪素材上 conc 被压缩到 8 fps 后归零，
+  // 于是同一刀在第一次跑是 hardcut、命中缓存后变 dissolve。卡片标签会进清单，
+  // 所以这不是"无所谓的美化"，是清单会变。
+  const FASTCUT = join(CLIPS, '07-fastcut.mp4');
+  if (!existsSync(FASTCUT)) return;
+  await withTempCache(async () => {
+    const run = () => runStoryboard({
+      input: FASTCUT, planOnly: true, detector: 'hsv', strategy: 'compact', transcript: 'off', cache: true,
+    });
+    const a = await run();
+    const b = await run();
+    assert.equal(a.cached, false, '第一次应当 miss');
+    assert.equal(b.cached, true, '第二次应当命中');
+    assert.deepEqual(a.cuts.map((c) => c.t), b.cuts.map((c) => c.t), '切点时间必须一致');
+    assert.deepEqual(a.cuts.map((c) => c.type), b.cuts.map((c) => c.type),
+      '标签必须一致（07-fastcut 曾在第 2 刀从 hardcut 漂成 dissolve）');
+  });
+});

@@ -81,7 +81,7 @@ function structCorr(a, b) {
  * @param {{prints:Uint8Array[], means:number[], t:number, fps:number, deltaSec?:number}} opts
  *   t：切点时刻（秒）；prints/means 的下标是帧号
  */
-export function flashEvidence({ prints, means, t, fps, deltaSec = DELTA_SEC, scores }) {
+export function flashEvidence({ prints, means, t, fps, scoreFps = fps, deltaSec = DELTA_SEC, scores }) {
   const delta = Math.max(1, Math.round(deltaSec * fps));
   const center = Math.round(t * fps);
   const lo = Math.max(0, center - delta);
@@ -127,9 +127,16 @@ export function flashEvidence({ prints, means, t, fps, deltaSec = DELTA_SEC, sco
   let conc = 0;
   if (Array.isArray(scores) && scores.length) {
     const seg = [];
-    // scores 的第 i 项是「第 i 帧相对第 i-1 帧」的分数，所以下标要减一
-    for (let i = lo; i <= hi; i++) {
-      const s = scores[i - 1];
+    // **分数序列用它自己的帧率索引**：缓存命中时指纹是 8 fps 打包版，而分数是按真实帧存的
+    // （stats 全量在缓存里）。用 prints 的 lo/hi 去索引分数会整体错位 —— 实测 07-fastcut
+    // 因此把 hardcut 判成 dissolve（conc 0.99 → 0）。
+    const sFps = Number(scoreFps) > 0 ? Number(scoreFps) : fps;
+    const sDelta = Math.max(1, Math.round(deltaSec * sFps));
+    const sCenter = Math.round(t * sFps);
+    const sLo = Math.max(0, sCenter - sDelta);
+    const sHi = Math.min(scores.length, sCenter + sDelta);
+    for (let i = sLo; i <= sHi; i++) {
+      const s = scores[i - 1];   // 第 i 项是「第 i 帧相对第 i-1 帧」
       if (Number.isFinite(s)) seg.push(s);
     }
     if (seg.length >= 2) {
@@ -160,7 +167,7 @@ export function flashEvidence({ prints, means, t, fps, deltaSec = DELTA_SEC, sco
  * @param {{prints?:Uint8Array[], means?:number[], fps?:number, scores?:number[]}} data
  * @returns {Array<object>} 新数组，元素是 {...cut, type, evidence}
  */
-export function tagCuts(cuts, { prints, means, fps = 25, scores } = {}) {
+export function tagCuts(cuts, { prints, means, fps = 25, scoreFps = fps, scores } = {}) {
   if (!Array.isArray(cuts)) return [];
   if (!Array.isArray(prints) || !Array.isArray(means) || prints.length === 0) {
     // 没有逐帧数据（例如复用缓存）：保持原样，只补一个中性标签
@@ -169,7 +176,7 @@ export function tagCuts(cuts, { prints, means, fps = 25, scores } = {}) {
 
   const rows = cuts.map((c) => ({
     ...c,
-    evidence: flashEvidence({ prints, means, t: c.t, fps, scores }),
+    evidence: flashEvidence({ prints, means, t: c.t, fps, scoreFps, scores }),
     type: null,
   }));
 

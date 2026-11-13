@@ -170,13 +170,13 @@ export function resolveCuts({
     // 所以这里用指纹自己的帧率；`scores` 是按真实帧存的，帧率不一致时不喂给 tagCuts。
     const tagFps = Number(printFps) > 0 ? Number(printFps) : fps;
     const sameRate = !(Number(printFps) > 0) || Math.abs(Number(printFps) - Number(fps)) < 1e-6;
+    // 分数序列**永远按真实帧率**给（stats 在缓存里是全量的），指纹用打印帧率 —— 两者别混。
     cuts = tagCuts(cuts, {
       prints,
       means,
       fps: tagFps,
-      ...(sameRate
-        ? { scores: scan.stats?.map((s) => s.score) }
-        : (Array.isArray(scoresPack) ? { scores: scoresPack } : {})),
+      scoreFps: fps,
+      scores: scan.stats?.map((s) => s.score),
     });
   }
 
