@@ -1340,7 +1340,10 @@ export async function runStoryboard(opts) {
       globalIndex += 1;
       frames.push({ buffer: shot.buffer, w: r.pw, h: r.ph });
       const text = aligned[k] ?? null;
-      const cutCount = absCuts.filter((t) => t >= f.from && t < f.to).length;
+      // **只数"真正落在格子内部"的切点**：格子正常就是从某一刀开始的，若把左边界也算进去，
+      // 几乎每一格都会显示 `cuts 1`，于是清单会告诉模型"这一格含 2 个镜头"——而它 100% 照做
+      // （2026-11-14 实测：清单写反话时 24/24 跟着错）。左边界属于上一格，用 epsilon 排掉。
+      const cutCount = absCuts.filter((t) => t > f.from + 1e-3 && t < f.to - 1e-3).length;
       cellMeta.push({
         i: globalIndex,
         sheet: si + 1,

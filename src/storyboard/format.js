@@ -1065,9 +1065,16 @@ export function formatManifest(result, {
     const markTag = c.via === 'mark' ? '  [integral]' : '';
     // 这一格的边界是某段渐变的中点（叠化的中间那一刀）：不标的话模型会当成硬切
     const gradTag = gradCells.has(c.i) ? '  (transition)' : '';
+    // 跨刀格子要**明说**（2026-11-14 实测）：
+    // 模型会 100% 照做清单里写的事实（把清单写成反话，它 24/24 跟着错），但"以清单为准"这种
+    // 口号只值注意力效应（+16.7 pp，p=0.125）。只有**显式陈述**才可靠 —— 明确写"这一格含 2 个镜头"
+    // 时 12/12 正确。所以这里把 `cuts N` 变成一个句子，而不是一个数字。
+    const crossTag = c.cuts >= 1
+      ? `  cuts ${c.cuts} → this cell spans ${c.cuts + 1} shots (not a single shot)`
+      : '';
     const head = `cell ${c.i}${where} = ${tc(c.t_start)}-${tc(c.t_end)}` +
       (showFrame ? ` frame@${tc(c.t_frame)}` : '') +
-      (c.cuts ? `  cuts ${c.cuts}` : '') + tierTag + markTag + gradTag;
+      crossTag + tierTag + markTag + gradTag;
     const body = ref ? `${head}  → ${ref}`
       : (dupOf.has(c.i) ? `${head}  → same as cell ${dupOf.get(c.i)}`
         : (text ? `${head}\n    ${text}` : head));
