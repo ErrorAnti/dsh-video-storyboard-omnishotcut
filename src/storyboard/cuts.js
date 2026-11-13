@@ -89,6 +89,25 @@ export function shouldTakeSpikes({
  * @param {Array}  [o.means]        逐帧亮度均值（打标签用）
  * @returns {{cuts: Array, refinedBursts: Array, trace: string[]}}
  */
+/**
+ * **多长的转场才可能是"真换镜头"**：超过这个宽度的 Fade 一律不删。
+ *
+ * 判据收紧的原因（2026-11-13 自审）：原规则只看「模型说是转场 + 亮度证据像闪光」，
+ * 于是一段 1 s 的**真·白闪转场**（闪完画面换了）如果 `nv` 算得偏小也会被删掉。
+ * 实测我们的样本里那个误报是 **0.083 s** 的 Fade —— 闪光都是瞬时的。
+ * 所以加一条宽度上限：只有比它短的才允许删，长转场保留（宁可多一格，不许丢镜头）。
+ */
+export const FLASH_TRANSITION_MAX_SEC = 0.25;
+
+/** 该切点是不是"短到可以判定为闪光"的转场。缺区间信息时按旧行为（可删）。 */
+export function isFlashTransition(cut) {
+  if (cut?.type !== 'flash' || cut?.kind !== 'transition') return false;
+  const a = Number(cut.from);
+  const b = Number(cut.to);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return true;
+  return (b - a) <= FLASH_TRANSITION_MAX_SEC;
+}
+
 export function resolveCuts({
   scan, scanMode = 'mc', capGap = 0, strategy, refineBursts = true,
   allowStillSpikes = true, allowRefineBursts = true,
@@ -171,9 +190,10 @@ export function resolveCuts({
   //      亮度冲高过、又回到原样、结构没变。白闪**转场**的 nv 很大，不会被误伤。
   // 为什么只在这一种组合下删：删除会丢掉"这里在动"的信息（见 flash.js 头注释），
   // 而"转场型白闪"是个例外 —— 它既不是新镜头，也不是连续运动，留着只会多出一格。
-  if (!textOnly && cuts.some((c) => c?.type === 'flash' && c?.kind === 'transition')) {
+
+  if (!textOnly && cuts.some((c) => isFlashTransition(c))) {
     const before = cuts.length;
-    cuts = cuts.filter((c) => !(c?.type === 'flash' && c?.kind === 'transition'));
+    cuts = cuts.filter((c) => !isFlashTransition(c));
     trace.push(`drop-flash-transition:${before}->${cuts.length}`);
   }
 

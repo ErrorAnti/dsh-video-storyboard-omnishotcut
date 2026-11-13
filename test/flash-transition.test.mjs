@@ -80,3 +80,24 @@ test('判据阈值与 flash.js 同源（改动必须同步）', () => {
   assert.equal(typeof NV_MAX, 'number');
   assert.equal(typeof CORR_MIN, 'number');
 });
+
+test('长转场（>0.25s）即使亮度像闪光也不许删 —— 那是真换镜头', () => {
+  const cuts = [
+    { t: 1.0, score: 0, kind: 'cut' },
+    // 1 秒的白闪转场：模型标 Fade、亮度证据像 flash，但宽度超过阈值
+    { t: 5.0, score: 0, kind: 'transition', label: 'Fade', type: 'flash', from: 4.5, to: 5.5 },
+    { t: 9.0, score: 0, kind: 'cut' },
+  ];
+  const out = resolveCuts(baseOpts(cuts));
+  assert.equal(out.cuts.length, 3, '长转场必须保留');
+});
+
+test('短转场（<=0.25s）仍然按闪光删掉', () => {
+  const cuts = [
+    { t: 1.0, score: 0, kind: 'cut' },
+    { t: 5.04, score: 0, kind: 'transition', label: 'Fade', type: 'flash', from: 5.0, to: 5.08 },
+    { t: 9.0, score: 0, kind: 'cut' },
+  ];
+  const out = resolveCuts(baseOpts(cuts));
+  assert.equal(out.cuts.length, 2, '短闪仍然要删');
+});
