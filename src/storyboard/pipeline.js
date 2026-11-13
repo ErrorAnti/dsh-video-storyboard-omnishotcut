@@ -35,7 +35,7 @@ import {
   AUTO_CANDIDATES, AUTO_STRATEGY, BIN_COST, DEFAULT_STRATEGY, MARK_BOOST, READABILITY_ORDER, STRATEGIES,
   applyMarkBoost, applyStrategy, applyTransitionBoost, applyTierMap, autoSheetCap, shouldForceSheetCap,
   fitCanvas, pickAutoStrategy, resolveStrategy,
-  framesFromBounds, integralMarks, levelAt, levelCurve, readabilityOf, tierHistogram, thresholdsFor,
+  framesFromBounds, integralMarks, maxReadableTier, levelAt, levelCurve, readabilityOf, tierHistogram, thresholdsFor,
   needsTimeFloor, splitStaticShots, STATIC_SHOT_MAX_FRAMES, STATIC_SHOT_MAX_SEC,
 } from './tiers.js';
 import { solve, toRects } from './pack.js';
@@ -654,6 +654,9 @@ export async function runStoryboard(opts) {
       const k = Math.max(1, Math.min(8, Math.ceil(Math.sqrt(sg.length))));
       tr = sg.map(() => k);
     }
+    // 最小格不许跌破 shot 级（面积口径）：太短的镜头会拿到 1/6、1/7 这类档位，缩成色块。
+    const tierCap = maxReadableTier(canvas.width, canvas.height);
+    if (tierCap < 8) tr = tr.map((t) => (Number(t) === 0 ? 0 : Math.min(Number(t), tierCap)));
     return { segs: sg, raw, tiers: tr, plan: solve(tr, PACK) };
   };
   const minCellOf = (b) => {
@@ -1164,7 +1167,9 @@ export async function runStoryboard(opts) {
       const tr = name === 'skim'
         ? freeRaw.map((t) => (Number(t) === 0 ? 0 : 8))
         : applyStrategy(freeRaw, name);
-      const p = solve(tr, packFor(name));
+      const capFree = maxReadableTier(canvas.width, canvas.height);
+      const tr2 = capFree < 8 ? tr.map((t) => (Number(t) === 0 ? 0 : Math.min(Number(t), capFree))) : tr;
+      const p = solve(tr2, packFor(name));
       const w = Math.min(...p.cells.map((c) => Math.round(c.w * canvas.width)));
       const h = Math.min(...p.cells.map((c) => Math.round(c.h * canvas.height)));
       return {
