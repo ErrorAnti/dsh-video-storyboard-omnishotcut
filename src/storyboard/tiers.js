@@ -950,27 +950,6 @@ export function tierHistogram(tiers) {
  *   shot        160×90 以上，能分辨"是不是同一个镜头"
  *   composition 再小就只是色块
  */
-/** 一个"还是同一个镜头"级别的最小格子面积（160×90），与 readabilityOf 的 shot 线同源。 */
-export const MIN_CELL_AREA = 160 * 90;
-
-/**
- * **档位上限**：让每格面积不小于 shot 级。
- *
- * 为什么要这条：取消"跨切点合并"之后，很短的镜头会拿到很细的档位（1/6、1/7），
- * 格子缩到 composition（面积 < 160×90）——比我们实测过的最小格（202×114）还小，
- * 没有任何可读性数据支撑。这里给出"还能看清"的最细档位，调用方用它夹一下 tier。
- *
- * 口径是**面积**（与 readabilityOf 一致），不是单边：800×334 上算出来是 4（200×83 = 16600 ≥ 14400）。
- */
-export function maxReadableTier(canvasW, canvasH, minArea = MIN_CELL_AREA) {
-  const w = Number(canvasW) || 0;
-  const h = Number(canvasH) || 0;
-  const area = Number(minArea) > 0 ? Number(minArea) : MIN_CELL_AREA;
-  if (!(w > 0) || !(h > 0)) return TIER_MAX;
-  const t = Math.floor(Math.sqrt((w * h) / area));
-  return Math.max(TIER_MIN, Math.min(TIER_MAX, t));
-}
-
 export function readabilityOf(w, h) {
   const area = (Number(w) || 0) * (Number(h) || 0);
   if (w >= 480 && h >= 270) return 'text';
