@@ -86,10 +86,15 @@ test('注册表：现役后端都要曲线（needsCurve），且只有模型后�
     assert.equal(entry.needsCurve, true, `${entry.id}: 逐帧曲线仍由 HSV 给，现役后端都是 true`);
   }
   assert.deepEqual(getDetector('hsv').bypassStages, [], 'hsv 的两个补刀阶段都要开着');
+  // **只关阶段 1，阶段 2 必须开着**（2026-11-13 实测，别改回去）：
+  // OmniShotCut 会把某些段落标成 `Padding`，桥按契约丢掉该段两侧边界 —— PPT/录屏类素材上
+  // 实测 deck.mp4 从 8 页只切出 4 页；保留阶段 2（爆点细扫）能把它捞回来（4/8 → 8/8）。
+  // 阶段 1（极静补刀）则相反：它的入口门槛 perSec<0.1 在 OSM 的切点上基本不成立，6 条素材
+  // 一次都没触发，关掉零影响。
   assert.deepEqual(
     [...getDetector('omnishotcut').bypassStages].sort(),
-    ['refine-bursts', 'still-spikes'],
-    'omnishotcut 已经逐帧给全量边界，阶段 1/2 必须关掉',
+    ['still-spikes'],
+    'osm 只关阶段 1；阶段 2 是 Padding 段的补救手段，必须保留',
   );
   // 表里那个数就是适配器的常数（两个地方各写一遍，靠这条盯着）
   assert.equal(getDetector('omnishotcut').minGap, OSM_MIN_GAP);

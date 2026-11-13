@@ -102,6 +102,48 @@ function packScoresAt(stats, n) {
   return out.map((x) => +x.toFixed(2));
 }
 
+/* ---------------------------------------------------------------- 补位规则（fillGaps 的判据） */
+
+/**
+ * 单板格数上限（**硬顶**）。
+ *
+ * `fillGaps` 有三招补位：① 减帧到较小平方数；② 时间重新均分；③ 切几刀补到较大平方数。
+ * **①②都是把 `[lo, hi]` 按时间重新等分**，段边界（= 切点）整个丢掉：一条 6 镜头 18 s 的
+ * 素材因此变成 4 格、每格跨 1~2 个切点，2 个镜头一帧都没出现。而图像 token 里**没有
+ * "格子边界"**，所以"跨刀格子"对模型是**不可见的错误**，只能靠清单文字兜。
+ *
+ * 但"一律不许合并"会让快剪素材无限膨胀，所以留一个上限：单板 **> 12 格**时才允许回到合并。
+ * 最新实测每板 ≤12 格的可读性都没问题（9 格 100%、12 格 98.3%），"为了填满而合并"没有收益、
+ * 只有信息损失。
+ */
+export const CELL_CAP = 12;
+
+/**
+ * 这个 bin 里有没有**跨切点**：`segs` 覆盖的段里，**除第一段外**是否还有 `via === 'cut'` 的段。
+ *
+ * 第一段即使 `via === 'cut'` 也只是这一格的**左边界**，不算跨。纯函数，好测。
+ */
+export function hasCutInBin(segs, seqs) {
+  const list = [...seqs].sort((a, b) => a - b);
+  return list.slice(1).some((i) => segs?.[i]?.via === 'cut');
+}
+
+/** 这个 bin 里有没有转场段 —— 转场不许被补位重排（见 `fillGaps` 的转场保护）。 */
+export function hasTransitionInBin(segs, seqs) {
+  return [...seqs].some((i) => segs?.[i]?.via === 'transition');
+}
+
+/**
+ * 这个 bin 的补位能不能**重排**（①减帧 / ②时间均分）。
+ *
+ * 跨了切点就不许 —— 重排会把相邻镜头并成一格，切点边界再也找不回来；超过 `cap` 格才放开
+ * （宁可合并，也不许快剪素材无限膨胀）。③（段内部再切）与 free-filler 不走这个判据。
+ */
+export function shouldRepartition(segs, seqs, cap = CELL_CAP) {
+  if (seqs.length > cap) return true;
+  return !hasCutInBin(segs, seqs);
+}
+
 export async function runStoryboard(opts) {
   const {
     input: inputRaw,
@@ -765,14 +807,20 @@ export async function runStoryboard(opts) {
       let worst = null;
       for (const [bin, area] of fills) if (!worst || area < worst.area) worst = { bin, area };
       if (!worst || worst.area >= FILL_TARGET) break;
+      const binSeqs = cur.plan.cells.filter((c) => c.bin === worst.bin).map((c) => c.seq);
       // **补位不能动转场段**：fillGaps 会重建这一格里的分段（via 全被抹成 'start'），
       // 于是"这一段是转场"就没法再传给档位系统。代价只是这张图填充率低一点。
-      if (cur.plan.cells.some((c) => c.bin === worst.bin && cur.segs[c.seq]?.via === 'transition')) break;
+      if (hasTransitionInBin(cur.segs, binSeqs)) break;
+      // **不许把相邻镜头合并成一格**（跨切点合并，见 `CELL_CAP`）：下面①②两招都是把
+      // `[lo, hi]` 按时间**重新等分** —— 切点边界整个丢掉，两三个镜头挤进一格、还有镜头
+      // 一帧都不出现，而图像 token 里没有"格子边界"，模型看不出这是错的。
+      // 跨了切点就只许"再切"：③（段内部补刀）与 free-filler 的刀都落在段内部，边界不动。
+      const mayMerge = shouldRepartition(cur.segs, binSeqs, CELL_CAP);
 
       // **先试"减帧"**：n 个正方形铺不满时，减到最近的较小平方数反而能 100%，
       // 而且格子放大一档（6 个 1/3 → 4 个 1/2），画面更清楚。这比"切几刀补到较大平方数"
       // 省帧、也不会把张数顶开 —— 唯一代价是少看几个瞬间。
-      {
+      if (mayMerge) {
         const cellsOfBin = cur.plan.cells.filter((c) => c.bin === worst.bin);
         const nb = cellsOfBin.length;
         const small = [4, 9, 16, 25].filter((k) => k < nb).pop();
@@ -811,7 +859,7 @@ export async function runStoryboard(opts) {
       // **第三招：把这张图覆盖的时间重新均分，档位统一**（n → 最近的平方数）。
       // 混合档位时行内矮格上方的缝是几何必然（一行里 400 和 133 并排，行高取大的那个），
       // 只有"整张图尺寸一致"才能铺满。代价是这张图内部不再区分长镜头/快剪 —— 只在它欠满时用。
-      {
+      if (mayMerge) {
         const cellsOfBin = cur.plan.cells.filter((c) => c.bin === worst.bin);
         const nb = cellsOfBin.length;
         const sq = [4, 9, 16, 25].reduce(

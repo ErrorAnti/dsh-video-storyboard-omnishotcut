@@ -24,7 +24,7 @@ export const omniShotCutDetector = {
   label: 'OmniShotCut v1.5',
   /** 模型只给"边界在哪"，逐帧曲线仍要 HSV 给（清单/档位/闪光标签全靠它） */
   needsCurve: true,
-  bypassStages: ['still-spikes', 'refine-bursts'],
+  bypassStages: ['still-spikes'],
   minGap: MIN_GAP,
 
   /**
