@@ -619,6 +619,20 @@ export async function runStoryboard(opts) {
       duration: winDur, start: winStart, cuts: segCuts, marks: sampleMarks,
       transitions: keptTransitions, maxFrames: cap,
     });
+    // **转场段不占格子**（2026-11-13）：
+    // 叠化的中点帧是两镜头叠加的过渡帧（实测肉眼可见双曝光），里面没有任何"属于某一个镜头"的画面，
+    // 给模型看只会制造困惑。转场这个事实由清单的 `grad:` 行说明；它的两个边界仍然参与分段，
+    // 但不再单独占一格。
+    if (relTransitions.length) {
+      sg = sg.filter((s) => s.via !== 'transition');
+      // 转场的两个边界**也是镜头边界**（切点在转场中点，不在边上），所以这些段的起点
+      // 必须标成 `via:'cut'`——否则下游的"不许跨切点合并"会认为这里没有边界而把镜头并掉。
+      const near = (a, b) => Math.abs(Number(a) - Number(b)) < 1e-6;
+      sg = sg.map((s) => {
+        const edge = relTransitions.some((tr) => near(tr.from, s.to) || near(tr.to, s.from));
+        return edge && s.via !== 'cut' ? { ...s, via: 'cut' } : s;
+      });
+    }
     if (Number(minFrames) > 1) sg = ensureMinFrames(sg, Math.min(24, Math.round(Number(minFrames))));
     /**
      * **切点撑不起密度时按时间兜底**（issue #87）。
