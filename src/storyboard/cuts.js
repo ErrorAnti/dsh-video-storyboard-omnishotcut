@@ -14,6 +14,7 @@
  *   ├ 1. 极静素材补刀   perSec < 0.1 才进；会**替换**整个 cuts
  *   ├ 2. 爆点细扫       fine.length > coarse.length 才采纳；会**整窗替换**
  *   ├ 3. 丐中丐合并     cuts+1 > 56 才触发；**逐轮加大间隔**直到装得下
+ *   ├ 3.5 极短微格      相邻两刀 ≤0.35s 且指纹距离 ≤12 → 删后一刀（`DSH_NO_SLIVER=0` 关）
  *   └ 4. 打标签         只加 type/evidence，**不增不删**
  *
  * **新增"加刀"或"删刀"的阶段，只能排在 3 之后、4 之前。**
@@ -26,7 +27,7 @@
  */
 
 import {
-  refineCutsByWindow, spikeCuts, suppressClose,
+  PRINT_FPS, refineCutsByWindow, spikeCuts, suppressClose,
 } from './scan.js';
 import { tagCuts } from './flash.js';
 import { STRATEGIES } from './tiers.js';
@@ -87,6 +88,7 @@ export function shouldTakeSpikes({
  * @param {number} o.winDur         窗口长度（秒）
  * @param {Array}  [o.prints]       逐帧指纹（打标签用）
  * @param {Array}  [o.means]        逐帧亮度均值（打标签用）
+ * @param {number} [o.printFps]     指纹自己的帧率（缓存命中时是抽稀后的 8 fps）
  * @returns {{cuts: Array, refinedBursts: Array, trace: string[]}}
  */
 /**
@@ -106,6 +108,73 @@ export function isFlashTransition(cut) {
   const b = Number(cut.to);
   if (!Number.isFinite(a) || !Number.isFinite(b)) return true;
   return (b - a) <= FLASH_TRANSITION_MAX_SEC;
+}
+
+/**
+ * 极短微格：**同一画面被切了两刀**（过分割），不许产出 <0.35 s 的格子。
+ *
+ * 为什么两条判据都要：只看 Δt 会把真快剪（07-fastcut 每刀 0.29 s）整批删光；
+ * 只看距离会把"两镜头长得像但确实换了"删掉。Δt 管"近"，指纹距离管"是不是同一画面"。
+ *
+ * 距离口径：两刀**各自左侧一帧**的 16×9 灰度缩略图平均绝对差（0–255）。左帧落在
+ * "被这一刀结束的那个镜头"里，所以重复刀的两帧必然同画面（≈0–10），真快剪的两帧
+ * 必然分属相邻两个镜头（实测 ≥16.6）。12 是实测间隙（8.9 … 16.6）的几何中点。
+ *
+ * ⚠️ 指纹可能是**打包过的 8 fps 版**（缓存命中）也可能是原生 fps（缓存未命中），
+ * 所以下标先归一到 `PRINT_FPS` 网格再取帧 —— 否则同一段视频两次跑的距离不同。
+ */
+export const SLIVER_MAX_GAP_SEC = 0.35;
+export const SLIVER_MAX_DIST = 12;
+
+/** 开关：默认开；`DSH_NO_SLIVER=0 / false / off / no` 关掉（留一条回退路） */
+export function sliverEnabled(env = process.env) {
+  const v = String(env?.DSH_NO_SLIVER ?? '').trim().toLowerCase();
+  return !(v === '0' || v === 'false' || v === 'off' || v === 'no');
+}
+
+/**
+ * 删掉"同一画面上的第二刀"。
+ *
+ * 保留**前一刀**（先到的边界才是镜头真正开始的地方）；`kind==='transition'` 一律不参与 ——
+ * 转场中点的左帧是过渡中间态，不代表任何镜头，且它的取舍归第 5 阶段管，这里不许抢。
+ *
+ * @param {Array} cuts
+ * @param {{prints?: Uint8Array[], printFps?: number}} o
+ * @returns {{cuts: Array, dropped: Array<{t:number, dt:number, d:number}>}}
+ */
+export function dropSliverCuts(cuts, { prints = null, printFps = 0 } = {}) {
+  const list = Array.isArray(cuts) ? cuts.filter((c) => c && Number.isFinite(Number(c.t))) : [];
+  const n = Array.isArray(prints) ? prints.length : 0;
+  const fps = Number(printFps) > 0 ? Number(printFps) : 0;
+  if (list.length < 2 || n < 2 || fps <= 0) return { cuts: Array.isArray(cuts) ? cuts : [], dropped: [] };
+
+  const step = Math.max(1, Math.round(fps / PRINT_FPS));   // 统一到 PRINT_FPS 网格（见上面注释）
+  const at = (i) => prints[Math.min(n - 1, Math.max(0, i))];
+  /** 该时刻**左侧**那一帧在指纹数组里的下标 */
+  const left = (t) => Math.round((Number(t) * fps) / step) * step - step;
+  const dist = (a, b) => {
+    let s = 0;
+    for (let i = 0; i < a.length; i += 1) s += Math.abs(a[i] - b[i]);
+    return s / a.length;
+  };
+
+  const out = [];
+  const dropped = [];
+  for (const c of list) {
+    const prev = out[out.length - 1];
+    if (prev && prev.kind !== 'transition' && c.kind !== 'transition') {
+      const dt = Number(c.t) - Number(prev.t);
+      if (dt > 0 && dt <= SLIVER_MAX_GAP_SEC) {
+        const d = dist(at(left(prev.t)), at(left(c.t)));
+        if (d <= SLIVER_MAX_DIST) {
+          dropped.push({ t: Number(c.t), dt, d: +d.toFixed(1) });
+          continue;
+        }
+      }
+    }
+    out.push(c);
+  }
+  return { cuts: out, dropped };
 }
 
 export function resolveCuts({
@@ -160,6 +229,15 @@ export function resolveCuts({
     if (fitted.length < cuts.length) {
       trace.push(`merge:${cuts.length}->${fitted.length}@${gap.toFixed(1)}s`);
       cuts = fitted;
+    }
+  }
+
+  // ---- 3.5 极短微格：同一画面被切了两刀 → 删后一刀（阶段 3 之后、4 之前，见文件头）
+  if (!textOnly && Array.isArray(prints) && prints.length && sliverEnabled()) {
+    const sliver = dropSliverCuts(cuts, { prints, printFps });
+    if (sliver.dropped.length) {
+      cuts = sliver.cuts;
+      for (const d of sliver.dropped) trace.push(`drop-sliver:${d.t}:${d.dt.toFixed(3)}`);
     }
   }
 
