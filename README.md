@@ -1,4 +1,22 @@
-# dsh-video-storyboard
+# dsh-video-storyboard（改版分支 omnishotcut）
+
+> ### ⚠️ 这是改版分支（非上游）
+>
+> 本仓库是 [SAOS-3624/dsh-video-storyboard](https://github.com/SAOS-3624/dsh-video-storyboard) 的**个人改版分支**。
+> **一切功劳归原作者**：用法问题、bug、star、赞助都请去上游。
+>
+> **我们改了什么**（因此下文的参数说明、输出示例可能与上游不同）：
+>
+> | # | 改动 |
+> |---|---|
+> | 1 | **切点后端可插拔**：新增 omnishotcut 可选后端，默认仍是 hsv |
+> | 2 | **单板不再跨切点合并**（单板 >12 格才放开），避免"一格含两个镜头" |
+> | 3 | **转场不再单独占格**：叠化中点帧是两镜头叠加的过渡帧，改由清单 grad: 行说明 |
+> | 4 | **白闪剔除加 0.25 s 宽度上限**：更宽的转场一律保留，避免误删真转场 |
+> | 5 | **清单更明确**：跨刀格子写成 cuts N → this cell spans N+1 shots；并修正"边界被算进格内"的假计数 |
+>
+> 逐项理由、实测数字与许可证说明见 [致谢与来源.md](致谢与来源.md)。
+
 
 > 让 AI 真正"看过"一段视频：**一张分镜图 + 一份带时间码的文本清单**，模型据此回答"第 3 分钟发生了什么""这句话对应哪一格"。
 >
@@ -632,14 +650,10 @@ video_storyboard({ input: "materials.mp4", hotwords: "位错 滑移 柏氏矢量
 | [CREDITS.md](CREDITS.md) | 第三方致谢、社区贡献、测试素材作者 |
 | [README.en.md](README.en.md) | English |
 
-## 赞助
+## 关于赞助
 
-这个插件是免费的，也不打算收费。如果它帮你省下了 API 费用或剪辑时间，
-欢迎请我喝杯奶茶 —— 完全自愿，不影响任何功能。
-
-<img src="docs/assets/wechat-reward.png" alt="微信赞赏码" width="220">
-
-> 仓库右上角的 **Sponsor** 按钮也指向这里（`.github/FUNDING.yml`）。
+本仓库是**改版分支**，不设赞助入口，也不附带原作者的赞赏码。
+如果想支持这个项目的原作者，请到上游仓库 [SAOS-3624/dsh-video-storyboard](https://github.com/SAOS-3624/dsh-video-storyboard) 点 Sponsor。
 
 ## 许可
 
