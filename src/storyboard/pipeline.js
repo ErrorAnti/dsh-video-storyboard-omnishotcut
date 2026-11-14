@@ -61,6 +61,49 @@ export const PICK_MODES = ['sharp', 'mid', 'thumb'];// 只有两种：时间码�
 export const BURN_MODES = ['index', 'none'];
 
 /**
+ * 图上编号的**语义**（`DSH_SHOT_ID_LABELS`，默认关）。这是"编号 = 格"与"编号 = 镜头"的开关。
+ *
+ *   关（默认）：一格一个号（1..N，N = 格数）—— 与历史输出**逐位相同**，不传这个环境变量就还是老行为。
+ *   开：**同一镜头派生的多格共用一个号**（1,1,2,3…），号的个数 = 镜头数；不同镜头仍递增。
+ *
+ * 为什么要有这个旋钮：模型会把"格数"直接当"镜头数"（QA 实测 125 条回答里 44.8% 在数格子，
+ * 原文"总共列出了16个格子，标记为1到16"）。补位（fillGaps → splitSeg）会把一个镜头切成两格，
+ * 两格各拿一个号 —— 于是 8 个镜头的故事板看起来像 9 个镜头。这个开关**只改"图上印什么"**：
+ * 清单文本（`cell 1 = …`）、切点、档位、格数一律不动，才能把"编号语义"当成唯一变量做 A/B。
+ */
+export function shotIdLabelsEnabled() {
+  const v = process.env.DSH_SHOT_ID_LABELS;
+  if (v === undefined || v === null || v === '') return false;
+  return !/^(0|false|off|no)$/i.test(String(v).trim());
+}
+
+/**
+ * `segs`（每格一段）→ 每格的镜头号（1 起）。
+ *
+ * 判据只有一条：**这一格是不是从某个切点开始的**。是 → 开新镜头；不是 → 沿用上一格的号。
+ * 这样"镜头内部补刀"（`splitSeg`：前半段 from = 镜头起点，后半段 from = 镜头内部）自然共用
+ * 同一个号；而 `via` 不能拿来做判据 —— `splitSeg` 会把 `via:'cut'` 原样复制到两半上，
+ * 按 `via` 计数会把一次补刀数成两个镜头。
+ *
+ * @param {Array<{from:number,to:number}>} segs
+ * @param {number[]} cutsSec 绝对切点时间（秒）
+ * @returns {number[]} 与 segs 等长的镜头号
+ */
+export function shotIdsFor(segs, cutsSec = []) {
+  const cuts = (Array.isArray(cutsSec) ? cutsSec : []).map(Number).filter(Number.isFinite);
+  const ids = [];
+  let shot = 0;
+  for (let i = 0; i < segs.length; i += 1) {
+    const from = Number(segs[i]?.from);
+    // i === 0 的格子即使不在切点上（窗口从镜头中间开始）也必须是第 1 个镜头
+    const starts = i === 0 || cuts.some((c) => Math.abs(c - from) <= 1e-3);
+    if (starts) shot += 1;
+    ids.push(shot);
+  }
+  return ids;
+}
+
+/**
  * @param {object} opts
  * @param {string} opts.input 视频路径
  * @param {number} [opts.from] 窗口起点（秒）
@@ -1194,12 +1237,20 @@ export async function runStoryboard(opts) {
   // 每格对到帧：seq 就是帧下标（排布不改顺序）
   const cellFrames = segs.map((s, i) => ({ ...s, tier: tiers[i], rawTier: rawTiers[i], seq: i }));
 
+  // 「编号 = 格」还是「编号 = 镜头」：只有 `DSH_SHOT_ID_LABELS` 开启时才给 rect 带 `shotId`。
+  // 关着的时候 rect 上**根本没有这个字段**，composePacked 照旧用 `r.index` —— PNG 逐位不变。
+  const shotIds = shotIdLabelsEnabled() ? shotIdsFor(segs, absCuts) : null;
+
   const sheetRects = [];
   for (let b = 0; b < packed.bins; b += 1) {
     // 把 `via` 带到 rect 上：拼图时要靠它决定"这一格画不画编号"
     sheetRects.push(toRects(packed.cells, {
       width: canvas.width, height: canvas.height, bin: b,
-    }).map((r) => ({ ...r, via: cellFrames[r.seq]?.via })));
+    }).map((r) => ({
+      ...r,
+      via: cellFrames[r.seq]?.via,
+      ...(shotIds ? { shotId: shotIds[r.seq] } : {}),
+    })));
   }
 
   if (segs.length < absCuts.length + 1) trace.push(`frames-merged:${absCuts.length + 1 + sampleMarks.length}->${segs.length}`);

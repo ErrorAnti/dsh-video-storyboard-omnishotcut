@@ -192,11 +192,13 @@ export function composePacked({
 
   // 第二轮：编号。**单独一轮**，否则后画的格子会盖掉前一格伸出来的描边。
   //
-  // 两条规则：
+  // 三条规则：
   //   1. **6 档及以上（1/6…1/8）用 scale 2**：格子只有 100px 宽，scale 3 的两位数要占 1/3，
   //      缩到 2 才不压画面（这是用户明确要求的；大格仍用 3，保证盲测的"86 不会被读成 88"）。
   //   2. **积分假切点的格子不编号**：它不是"换镜头"，只是"这一段一直在变"，
   //      编号会让模型以为那是独立镜头。图上编号因此会跳号，清单里的 k= 和时间才是准的。
+  //   3. 编号优先取 `r.shotId`（`DSH_SHOT_ID_LABELS` 开启时 pipeline 才会带）：**同一镜头派生的
+  //      多格共用一个号**，所以图上会出现 1,1,2,3…；没带就退回 `r.index`，与历史输出逐位相同。
   if (burn !== 'none') {
     const base = badgeScale(width);
     for (let i = 0; i < rects.length; i += 1) {
@@ -204,7 +206,7 @@ export function composePacked({
       if (!frames[i]) continue;
       if (r.via === 'mark') continue;
       const scale = Number(r.t) >= 6 ? Math.min(2, base) : base;
-      drawBadgePlain(buf, width, height, r.px + 2, r.py + 1, r.index, scale);
+      drawBadgePlain(buf, width, height, r.px + 2, r.py + 1, r.shotId ?? r.index, scale);
     }
   }
   return { buffer: buf, width, height };
