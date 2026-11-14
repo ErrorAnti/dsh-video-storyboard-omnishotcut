@@ -144,6 +144,39 @@ export function shouldRepartition(segs, seqs, cap = CELL_CAP) {
   return !hasCutInBin(segs, seqs);
 }
 
+/* -------------------------------------------- 格子阵：一张图的"几行几列、几格" */
+
+/**
+ * 一张图（一个 bin）的**格子阵**：`rows` = 取整后不同的上边缘行数，`cols` = 最宽那行的格数。
+ * `slots = rows * cols` 是这个阵的**格位总数**，`slots - n` 就是"空着几格".
+ *
+ * 为什么按**像素几何**（`toRects`，含取整与 1px 缝隙修补）而不是归一化坐标算：
+ * 模型看到的是像素；它数的是"阵里有几个位置"，不是 plan 里的元数据。
+ *
+ * 实测依据（G-L，2026-11-15）：3×3 阵只填 8 格 → 同一模型 20 次里 9 次报 9 格；
+ * 满阵（9 格）→ 20/20 全对（9 格板三处独立验证）。反证：档位数组从 `{2:2,3:7}` 改成 `{3:9}`
+ * 时板 PNG 的 sha256 **逐位相同** —— 档位数值够不到模型的眼睛，起作用的是"阵有没有洞".
+ *
+ * @param {Array<{x:number,y:number,w:number,h:number,bin?:number}>} cells 单张图的格子（可多张，按需自己切）
+ * @param {{width:number,height:number}} canvas
+ * @returns {{n:number, rows:number, cols:number, slots:number, rowCounts:number[]}}
+ */
+export function cellGrid(cells, { width, height } = {}) {
+  if (!Array.isArray(cells) || !cells.length) return { n: 0, rows: 0, cols: 0, slots: 0, rowCounts: [] };
+  const rects = toRects(cells, { width, height });
+  const tops = [...new Set(rects.map((r) => r.py))].sort((a, b) => a - b);
+  const rowCounts = tops.map((y) => rects.filter((r) => r.py === y).length);
+  const rows = rowCounts.length;
+  const cols = rows ? Math.max(...rowCounts) : 0;
+  return { n: rects.length, rows, cols, slots: rows * cols, rowCounts };
+}
+
+/**
+ * `DSH_FILL_HOLE=1` 才开"最后一格不留洞"（默认关）。
+ * 关掉时 `fillLastHole` 一步都不跑 —— 板 PNG 与改动前**逐位相同**。
+ */
+export const fillHoleEnabled = () => process.env.DSH_FILL_HOLE === '1';
+
 export async function runStoryboard(opts) {
   const {
     input: inputRaw,
@@ -983,6 +1016,91 @@ export async function runStoryboard(opts) {
     }
     return cur;
   };
+  /* ------------------------------ 最后一格不留洞（G-F 臂，2026-11-15，默认关） */
+
+  /**
+   * `fillGaps` 那三招修的是"占用率"，修不到"**阵里空着一格**"：
+   * 3 行 × 3 列的阵里放 8 格（3+2+3），占用率 88.9%、切点一刀没动，可模型看到的是
+   * **一个 3×3 的阵少了右下角那一格** —— 它就按阵报 9。
+   *
+   * 这一条只做一件事：某张图 fill < 0.95 且 `rows*cols - cells == 1`（只差一格）时，
+   * **把这张图的档位整体 +1**（格子小一档 → 第 n+1 格塞得进同一张图），
+   * 再在**某个段的内部**多切一帧把阵补满。三段边界一格不动（刀只落在段内部，绝不跨切点），
+   * 帧数上限、张数预算、清单文本格式全不动。
+   *
+   * 补哪一段：**先试这张图最后一个镜头**，不行再按段长从长到短兜底 —— 因为"整体 +1"之后
+   * 各段档位不再一致，插在大格与小格交界处会排出 2+3+4 那种更花的阵（实测 04-flash），
+   * 只有插完仍是满阵才接受。全都不成就 **什么都不做**（行为与不装这条规则时完全一致）。
+   *
+   * @param {{segs:Array, raw:number[], tiers:number[], plan:object}} b
+   * @param {number} maxFrames 调用方给的帧数上限（Infinity = 不限）
+   */
+  const fillLastHole = (b, maxFrames = Infinity) => {
+    let cur = b;
+    const startFrames = b.segs.length;
+    const binCap = b.plan.bins;          // 补位不许多开一张图：多一张就多付一张图像的钱
+    const FILL_FULL = 0.95;
+    for (let round = 0; round < 4; round += 1) {
+      // 1) 哪些图"欠满 + 阵里只差一格"
+      const holes = [];
+      for (let bin = 0; bin < cur.plan.bins; bin += 1) {
+        const cells = cur.plan.cells.filter((c) => c.bin === bin);
+        if (!cells.length) continue;
+        const fill = cells.reduce((a, c) => a + c.w * c.h, 0);
+        if (fill >= FILL_FULL) continue;
+        const g = cellGrid(cells, canvas);
+        if (g.slots - g.n !== 1) continue;  // 只修"只差一格"；差更多格不归这条管
+        holes.push({ bin, fill, cells, g });
+      }
+      if (!holes.length) break;
+      holes.sort((x, y) => x.fill - y.fill); // 先补最空的那张
+
+      let applied = null;
+      for (const hole of holes) {
+        const seqs = [...new Set(hole.cells.map((c) => c.seq))].sort((x, y) => x - y);
+        const seqSet = new Set(seqs);
+        // 档位整体 +1：有一格已经是 8 档（或自由尺寸 0）就没法再缩 → 这张图不满足条件
+        if (seqs.some((i) => !(Number(cur.tiers[i]) >= 1 && Number(cur.tiers[i]) < 8))) continue;
+        const lastSeq = seqs[seqs.length - 1];
+        const others = seqs
+          .filter((i) => i !== lastSeq)
+          .sort((x, y) => (cur.segs[y].to - cur.segs[y].from) - (cur.segs[x].to - cur.segs[x].from) || y - x);
+        // 太短（< 1s）的段取不出两张不同的画面；转场段的中点是双曝光，也不当补位目标
+        const order = [lastSeq, ...others].filter((i) => {
+          const s2 = cur.segs[i];
+          return Boolean(s2) && (s2.to - s2.from) >= 1.0 && s2.via !== 'transition';
+        });
+        for (const i of order) {
+          const tiers2 = cur.tiers.map((t, j) => (seqSet.has(j) ? Math.min(8, Number(t) + 1) : Number(t)));
+          const segs2 = [...cur.segs];
+          const fr = 0.35 + hash01(cur.segs[i].from) * 0.3;   // 与 fillGaps 同一套刀位：可复现、不总在正中
+          const parts = splitSeg(cur.segs[i], fr);
+          // raw 是策略之前的档位：拆两半就复制一份，长度与 segs 对齐（plan.rawTiers 才不会少一格）
+          const raw2 = [...cur.raw.slice(0, i), cur.raw[i], ...cur.raw.slice(i)];
+          segs2.splice(i, 1, ...parts);
+          const tiers3 = [...tiers2.slice(0, i), tiers2[i], ...tiers2.slice(i)];
+          if (segs2.length > maxFrames) continue;             // 帧数上限不动
+          const p2 = solve(tiers3, PACK);
+          if (p2.bins > binCap) continue;                    // 多开一张图 → 不算"塞得进同一张图"
+          const newCell = p2.cells.find((c) => c.seq === i);
+          if (newCell?.bin !== hole.bin) continue;           // 新格得落回这张图
+          const cells2 = p2.cells.filter((c) => c.bin === hole.bin);
+          if (cells2.length !== hole.g.n + 1) continue;
+          const g2 = cellGrid(cells2, canvas);
+          if (g2.slots !== g2.n) continue;                   // 补完还不是满阵 → 换一段，别硬塞
+          applied = { segs: segs2, raw: raw2, tiers: tiers3, plan: p2, cells: g2.n };
+          break;
+        }
+        if (applied) break;
+      }
+      if (!applied) break;                                   // 条件不满足 → 什么都不做
+      cur = { ...cur, segs: applied.segs, raw: applied.raw, tiers: applied.tiers, plan: applied.plan };
+      trace.push(`fill-hole:+1 cell=${applied.cells} tier+1`);
+      if (cur.segs.length > startFrames + 2) break;           // 兜底：最多补两格
+    }
+    return cur;
+  };
+
   // 补位不能只在不限帧时跑：显式给 maxFrames 时同样可以补到上限，
   // 否则 `maxFrames: 12` 反而比默认的 4 帧更少（issue #87）。补位内部有 fits() 守上限。
   built = fillGaps(built, capFrames);
@@ -1063,6 +1181,13 @@ export async function runStoryboard(opts) {
       }
     }
   }
+
+  // ---- 最后一格不留洞（G-F）：solve() 之后、定稿之前，把"只差一格"的阵补满。
+  //
+  // 位置必须在这里：压张数那一段可能重建 `built`（tidy → buildWithin → fillGaps），
+  // 对着压张数之前的版本判断"阵里有没有洞"是自欺 —— 和 `auto` 那段把补位放在
+  // fillGaps 之后是同一个理由。开关默认关，关掉时下面一行等于不存在。
+  if (fillHoleEnabled()) built = fillLastHole(built, capFrames);
 
   const { segs, raw: rawTiers, tiers, plan: packed } = built;
 
