@@ -160,9 +160,12 @@ if ($Cpu -and $cudaBound) { throw '-Cpu 与 -Cuda 互斥：一个要 CPU 版，�
 # 显卡探测总是跑（只读）：即使 -Cpu / -Cuda 指定了，报告里也要如实说这台机器有没有卡
 $gpu = Get-NvidiaGpu
 
+# 2026-11-16 决策：**CPU 是默认、也是唯一保证支持的形态**。
+# 有卡机器也默认装 CPU —— 端到端只慢 1.4–6 倍（短片 12 s / 120 s 片 35 s），
+# 换来 557 MB 而不是 4,984 MB 的安装体积，且没有驱动/flavor 配对问题。
+# 想快就显式 -Cuda cu128（标为实验性，不做多版本矩阵、不阻塞发布）。
 if ($Cpu) { $flavor = 'cpu' }
 elseif ($cudaBound) { $flavor = $Cuda }
-elseif ($gpu) { $flavor = 'cu128' }
 else { $flavor = 'cpu' }
 
 $IndexUrl = "https://download.pytorch.org/whl/$flavor"

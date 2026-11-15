@@ -1,4 +1,4 @@
-# 安装 OmniShotCut（设备自适应：有卡走 CUDA、没卡走 CPU）
+# 安装 OmniShotCut（默认 CPU；CUDA 为实验性可选项）
 
 > 文档角色：OmniShotCut 后端的安装与设备选择。
 > 唯一负责：怎么把 torch 装成这台机器该有的那一版、`DSH_OSM_DEVICE` / `DSH_OSM_THREADS` 的语义、装坏了怎么恢复。
@@ -8,15 +8,29 @@
 
 ```powershell
 cd <仓库根>
-pwsh -File plugin\scripts\install-omnishotcut.ps1      # 有卡 → cu128；没卡 → cpu
-node bin\doctor.mjs                                    # 第 5 节会印 device=cuda 或 device=cpu
+pwsh -File plugin\scripts\install-omnishotcut.ps1      # 默认装 CPU（557 MB）
+node bin\doctor.mjs                                    # 第 5 节会印 device=cpu
 ```
 
 装错版本的代价不是"跑不起来"，而是**悄悄跑慢 4 倍**（CPU 版 torch 在有卡的机器上一样能跑，
 只是 `torch.cuda.is_available()` 是 `False`，没人会注意）。所以设备选择是**显式**的，
 `doctor` 会把它印出来，桥每次启动也往 stderr 打一行。
 
-## 1. 两种机器，两条命令
+**默认就是 CPU，有显卡的机器也一样**（2026-11-16 决策）：
+
+| 对比 | CPU（默认） | CUDA（-Cuda cu128，实验性） |
+|---|---|---|
+| 安装体积 | **557 MB** | 4,984 MB |
+| 冷出板（18 s 片） | **11.8 s** | ~4.5 s |
+| 冷出板（120 s 片） | **35.2 s** | ~5.6 s |
+| BBC 200 窗口 F1 | **0.8896** | 0.8896（逐位相同） |
+| 失败模式 | 几乎没有 | 驱动 / torch↔torchvision flavor 配对 |
+
+只有**批量处理几十条片子**时上 CUDA 才划算（35 s × 50 ≈ 半小时 vs 5 分钟）。
+
+## 1. 两种装法（默认 CPU；CUDA 为实验性可选项）
+
+> 下面两节分别讲两种装法。**默认（不带参数）装的是 CPU**。
 
 ### 1.1 有 N 卡（Windows + 驱动正常，`nvidia-smi` 能报出型号）
 
