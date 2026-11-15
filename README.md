@@ -196,6 +196,10 @@ dsh plugin --profile web add dsh-video-storyboard       # 装插件，然后重�
 
 插件**不打包** ffmpeg 和 yt-dlp，只调用你自己装的那份。找不到时会给出安装指引，不会静默失败。
 
+切点模型后端 OmniShotCut 要单独装：torch 有 CUDA / CPU 两版，装错了不会报错、只会悄悄慢 4 倍。
+用 `pwsh -File scripts/install-omnishotcut.ps1`（有 N 卡）或加 `-Cpu`（没卡），
+细节见 [安装-OmniShotCut.md](安装-OmniShotCut.md)。
+
 ## 怎么用
 
 ### 贴一个链接

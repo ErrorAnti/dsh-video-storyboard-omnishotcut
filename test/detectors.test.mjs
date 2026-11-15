@@ -215,31 +215,46 @@ test('omnishotcut.scan：表里这一项真的接到适配器（cuts 来自桥�
   assert.deepEqual(r.osm, { ms: 42, shots: 8, fps: 24 });
 });
 
-test('omnishotcut.doctorChecks：三项全绿 / 缺 python / 权重太小 / 桥不在，逐项报', async () => {
+test('omnishotcut.doctorChecks：四项全绿 / 缺 python / 权重太小 / 桥不在，逐项报', async () => {
   const entry = getDetector('omnishotcut');
+  // 两条探针：`python -c IMPORT_PROBE`（python 项）与 `python <bridge> --probe-device`（device 项）
+  const probePayload = {
+    ok: true, requested: 'auto', device: 'cpu', threads: 4,
+    torch: '2.11.0+cpu', flavor: '2.11.0+cpu', torchvision: '0.26.0+cpu',
+    cudaAvailable: false, cudaVersion: null, gpu: null,
+  };
   const ctx = (omnishotcut, { pyOk = true, size = 200 * 1024 * 1024 } = {}) => ({
     config: { configPath: 'C:/video.json', omnishotcut },
     sourceText: '显式传参',
-    run: async () => (pyOk
-      ? { code: 0, stdout: '1.5\n3.12.1\n', stderr: '' }
-      : { code: 1, stdout: '', stderr: 'ModuleNotFoundError: No module named omnishotcut' }),
+    run: async (_bin, args) => {
+      if (Array.isArray(args) && args.includes('--probe-device')) {
+        return { code: 0, stdout: `${JSON.stringify(probePayload)}\n`, stderr: '' };
+      }
+      return pyOk
+        ? { code: 0, stdout: '1.5\n3.12.1\n', stderr: '' }
+        : { code: 1, stdout: '', stderr: 'ModuleNotFoundError: No module named omnishotcut' };
+    },
     stat: async () => (size === null ? null : { size }),
   });
 
   const all = await entry.doctorChecks(ctx({
     python: 'C:/py.exe', ckpt: 'C:/w.pth', bridge: 'C:/b.py', bridgeExists: true,
   }));
-  assert.deepEqual(all.map((i) => i.name), ['config-source', 'python', 'ckpt', 'bridge']);
+  assert.deepEqual(all.map((i) => i.name), ['config-source', 'python', 'device', 'ckpt', 'bridge']);
   assert.equal(all.filter((i) => i.quiet).length, 1, '只有"配置来源"是纯文本行');
   assert.ok(all.every((i) => i.ok), '配全时要全绿');
   assert.match(all[0].lines[0], /配置来源：C:\/video\.json（detector: 显式传参）/);
   assert.match(all[1].detail, /import omnishotcut 1\.5 \(Python 3\.12\.1\)/);
-  assert.match(all[2].detail, /权重：C:\/w\.pth \(200 MB\)/);
+  assert.match(all[2].detail, /device: cpu — torch 2\.11\.0\+cpu, threads 4/);
+  assert.match(all[3].detail, /权重：C:\/w\.pth \(200 MB\)/);
 
   const noPy = await entry.doctorChecks(ctx({ ckpt: 'C:/w.pth', bridge: 'C:/b.py', bridgeExists: true }));
   const py = noPy.find((i) => i.name === 'python');
   assert.equal(py.ok, false);
   assert.match(py.detail, /没配 python/);
+  const noPyDev = noPy.find((i) => i.name === 'device');
+  assert.equal(noPyDev.quiet, true, '没 python 时设备项只留一行说明，不再叠一条 ❌');
+  assert.match(noPyDev.lines[0], /跳过探测（没配 python）/);
 
   const pyBroken = await entry.doctorChecks(ctx(
     { python: 'C:/py.exe', ckpt: 'C:/w.pth', bridge: 'C:/b.py', bridgeExists: true },
@@ -263,6 +278,8 @@ test('omnishotcut.doctorChecks：三项全绿 / 缺 python / 权重太小 / 桥�
   const br = noBridge.find((i) => i.name === 'bridge');
   assert.equal(br.ok, false);
   assert.match(br.detail, /Python 桥不在/);
+  const noBridgeDev = noBridge.find((i) => i.name === 'device');
+  assert.equal(noBridgeDev.quiet, true, '桥不在时设备项也不该再叠一条 ❌');
 });
 
 /* ---------------------------------------------------------------- pipeline 侧 */

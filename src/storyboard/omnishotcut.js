@@ -12,7 +12,7 @@
  *
  * `detectors/omnishotcut.js` 这个条目只认本文件末尾的三个函数：
  * `resolve(cfg)`（配置校验，抛不回退）、`scan(opts)`（= hybridScan 加壳）、
- * `doctorChecks(ctx)`（自检三项，依赖注入，不起进程也能测）。
+ * `doctorChecks(ctx)`（自检四项：python / device / ckpt / bridge，依赖注入，不起进程也能测）。
  * `hybridScan` 仍然是 `scan` 的内核，直接调用照旧可用。
  *
  * ## 注入点
@@ -29,6 +29,7 @@
  * | code | 含义 |
  * |---|---|
  * | `no-weights` / `no-package` / `load-failed` / `infer-failed` / `decode` | 桥原样上报（契约 §1） |
+ * | `device-unavailable` / `device-invalid` / `threads-invalid` | 设备配置错了（`DSH_OSM_DEVICE` / `DSH_OSM_THREADS`）—— 桥原样上报，**不静默降级** |
  * | `missing-path` | `python` / `bridge` / `ckpt` 没给（调用方负责解析绝对路径） |
  * | `spawn-failed` | 子进程起不来（ENOENT、权限） |
  * | `timeout` | 超过 `timeoutMs`，进程已被杀 |
@@ -50,8 +51,11 @@ export const OSM_DETECTOR_ID = 'omnishotcut-v1.5';
  */
 export const OSM_MIN_GAP = 0.08;
 
-/** 桥能返回的错误码（契约 §1）——仅用于报错文案，不用于吞错 */
-const BRIDGE_CODES = ['no-weights', 'no-package', 'load-failed', 'infer-failed', 'decode'];
+/** 桥能返回的错误码（契约 §1 + 设备三项）——仅用于报错文案，不用于吞错 */
+const BRIDGE_CODES = [
+  'no-weights', 'no-package', 'load-failed', 'infer-failed', 'decode',
+  'device-unavailable', 'device-invalid', 'threads-invalid',
+];
 
 /** 子进程 stdout 上限：正常输出是几十字节，留 4MB 纯属防呆 */
 const MAX_STDOUT = 4 * 1024 * 1024;
@@ -539,6 +543,208 @@ export async function scan(opts = {}) {
 /** 权重体积地板：几十 KB 的占位文件 / Git LFS 指针不该等到第一次推理才炸。 */
 export const MIN_CKPT_BYTES = 100 * 1024 * 1024;
 
+/* ================================================================ 设备选择 ----
+ * 设备策略在**桥里执行**（`omnishotcut-bridge.py` 的 `resolve_device`），这里只做两件事：
+ *
+ *   1. `resolveDevice()` —— 同一套策略的 JS 版，给 doctor 判断"桥报的结果对不对"，
+ *      也给单测用（注入 `cudaAvailable` 就能在没卡的机器上验有卡分支）；
+ *   2. `parseTorchFlavor()` —— 把 `2.11.0+cu128` 这种版本串拆成能印给人看的形式。
+ *
+ * 为什么策略写两份：桥必须能**独立**跑（`bench/bridge_run.py`、手敲 python、用户排障），
+ * 所以它不能等 Node 告诉它用哪个设备。两份实现之间靠 doctor 的交叉校验兜底 ——
+ * 桥说 cuda、JS 算 cpu 时 doctor 直接报 FAIL，漂了就当场看见。
+ */
+
+/** 设备环境变量：`auto`（默认）| `cpu` | `cuda`。 */
+export const OSM_DEVICE_ENV = 'DSH_OSM_DEVICE';
+/** CPU 线程数环境变量（不设就 4 —— 本机 4P+4E 实测最快）。 */
+export const OSM_THREADS_ENV = 'DSH_OSM_THREADS';
+/** CPU 默认线程数：与桥里的 `DEFAULT_CPU_THREADS` 必须一致。 */
+export const OSM_DEFAULT_THREADS = 4;
+/** 合法取值。 */
+export const OSM_DEVICE_CHOICES = ['auto', 'cpu', 'cuda'];
+
+/**
+ * CPU 线程数：默认 4，`DSH_OSM_THREADS` 覆盖；非法值抛 `threads-invalid`（不猜）。
+ *
+ * @param {{env?: object}} [o]
+ * @returns {number}
+ */
+export function resolveThreads({ env = process.env } = {}) {
+  const raw = String(env?.[OSM_THREADS_ENV] ?? '').trim();
+  if (!raw) return OSM_DEFAULT_THREADS;
+  if (!/^\d+$/.test(raw) || Number(raw) < 1) {
+    throw codedError(
+      'threads-invalid',
+      `${OSM_THREADS_ENV}=${JSON.stringify(raw)} 必须正整数`,
+      { env: OSM_THREADS_ENV, value: raw },
+    );
+  }
+  return Number(raw);
+}
+
+/**
+ * 设备解析（与桥里 `resolve_device()` 同一套规则）。
+ *
+ * - `auto`：`cudaAvailable` 为真 → cuda，否则 cpu；
+ * - `cpu`：强制 cpu（有卡也走 cpu —— 验收里"模拟无卡"就是这条路）；
+ * - `cuda`：强制 cuda，**不可用就抛 `device-unavailable`**。
+ *
+ * 为什么显式 cuda 不可用必须抛：静默降级会让用户以为在跑显卡，实际 CPU 上跑，
+ * 120 s 的片子 5.6 s 变 24 s，还查不出原因。
+ *
+ * @param {{requested?: string, cudaAvailable?: boolean, env?: object}} [o]
+ * @returns {{requested: string, device: 'cuda'|'cpu', threads: number|null, cudaAvailable: boolean}}
+ */
+export function resolveDevice({ requested, cudaAvailable, env = process.env } = {}) {
+  const raw = requested ?? env?.[OSM_DEVICE_ENV] ?? '';
+  const req = String(raw).trim().toLowerCase() || 'auto';
+  if (!OSM_DEVICE_CHOICES.includes(req)) {
+    throw codedError(
+      'device-invalid',
+      `${OSM_DEVICE_ENV}=${JSON.stringify(req)} 不认识，只认 ${OSM_DEVICE_CHOICES.join(' / ')}`,
+      { env: OSM_DEVICE_ENV, value: req },
+    );
+  }
+  const has = Boolean(cudaAvailable);
+  if (req === 'cuda' && !has) {
+    throw codedError(
+      'device-unavailable',
+      `${OSM_DEVICE_ENV}=cuda，但 torch 看不到可用显卡。`
+      + '装 CUDA 版 torch（plugin/scripts/install-omnishotcut.ps1），'
+      + `或把 ${OSM_DEVICE_ENV} 设成 auto / cpu。不会静默降级。`,
+      { env: OSM_DEVICE_ENV, value: req },
+    );
+  }
+  const device = req === 'cuda' || (req === 'auto' && has) ? 'cuda' : 'cpu';
+  return {
+    requested: req,
+    device,
+    threads: device === 'cpu' ? resolveThreads({ env }) : null,
+    cudaAvailable: has,
+  };
+}
+
+/**
+ * `2.11.0+cu128` / `2.11.0+cpu` → 拆开；没有本地标记时按 `cudaVersion` 补一个。
+ *
+ * 为什么需要：`pip list` 里 `torch 2.11.0` 后面那个 `+cu128` 才是"这是哪一版 wheel"的证据 ——
+ * 事故里就是版本号对得上、后缀没了（见 `docs/incidents/torch-被-CPU-版覆盖.md`）。
+ *
+ * @param {string} version      `torch.__version__`
+ * @param {string|null} cudaVersion `torch.version.cuda`
+ * @returns {{version: string, flavor: string, label: string}}
+ */
+export function parseTorchFlavor(version, cudaVersion = null) {
+  const v = String(version ?? '').trim() || '?';
+  if (v.includes('+')) {
+    return { version: v, flavor: v.slice(v.indexOf('+') + 1), label: v };
+  }
+  const cu = String(cudaVersion ?? '').trim();
+  const flavor = cu ? `cu${cu.replace(/\./g, '')}` : 'cpu';
+  return { version: v, flavor, label: `${v}+${flavor}` };
+}
+
+/** doctor 的设备探针超时：这条要 import torch（2 GB 的库），8 s 默认值不够。 */
+const DEVICE_PROBE_TIMEOUT_MS = 30000;
+
+/**
+ * doctor 的设备项：跑 `python <bridge> --probe-device`，把桥的结论和 JS 的判定对一遍。
+ *
+ * 桥是设备策略的执行者，所以"解析到的 device"以桥为准；JS 只负责核对，
+ * 不一致就是两份实现漂了（这条自检本身就是防漂的）。
+ */
+async function deviceCheck(osm, run) {
+  const skip = (why) => ({
+    name: 'device', ok: true, quiet: true,
+    lines: [`     device：跳过探测（${why}）`],
+  });
+  if (!osm.python) return skip('没配 python');
+  if (!osm.bridge) return skip('没解析到桥脚本');
+  // 桥文件不在时探针必然失败，报"设备探测失败"只会盖住真正的原因（bridge 那条会说清楚）
+  if (osm.bridgeExists === false) return skip('桥脚本不在');
+
+  const r = (await run(osm.python, [osm.bridge, '--probe-device'], DEVICE_PROBE_TIMEOUT_MS)) ?? {};
+  let payload = null;
+  try {
+    payload = parseBridgePayload(r.stdout, r.stderr);
+  } catch { payload = null; }
+
+  if (!payload) {
+    const why = tail(r.stderr || r.stdout, 200);
+    return {
+      name: 'device', ok: false,
+      detail: `设备探测没拿到 JSON（退出码 ${r.code ?? '?'}）`,
+      lines: [
+        ...(why ? [`       ${why}`] : []),
+        '     → 桥要能和这个 python 一起跑：先修上面 python 那条，再回来看这里',
+      ],
+    };
+  }
+
+  if (payload.ok === false) {
+    const code = String(payload.code ?? '');
+    const msg = String(payload.message ?? '');
+    if (code === 'device-unavailable') {
+      return {
+        name: 'device', ok: false,
+        detail: `设备不可用：${msg}`,
+        lines: [
+          '     → ① 装 CUDA 版 torch：plugin\\scripts\\install-omnishotcut.ps1（不带 -Cpu）',
+          '       ② 或把 DSH_OSM_DEVICE 设成 auto / cpu（显式 cuda 不会静默降级）',
+          '       ③ 驱动：nvidia-smi 能报出显卡型号才算有卡',
+        ],
+      };
+    }
+    if (code === 'device-invalid' || code === 'threads-invalid') {
+      return {
+        name: 'device', ok: false,
+        detail: `${code}：${msg}`,
+        lines: ['     → DSH_OSM_DEVICE 只认 auto / cpu / cuda；DSH_OSM_THREADS 要正整数'],
+      };
+    }
+    return {
+      name: 'device', ok: false,
+      detail: `设备探测失败（${code || '未知'}）：${msg}`,
+      lines: ['     → 这个解释器 import torch 失败？见 plugin\\安装-OmniShotCut.md'],
+    };
+  }
+
+  const cudaAvailable = payload.cudaAvailable === true;
+  let expected;
+  try {
+    // env:{} —— 只核对"策略"，不让当前进程的 DSH_OSM_THREADS 影响预期值
+    expected = resolveDevice({ requested: payload.requested, cudaAvailable, env: {} });
+  } catch (err) {
+    return {
+      name: 'device', ok: false,
+      detail: `设备判定自检失败：${err.message}`,
+      lines: ['     → 桥说 ok 但 JS 的 resolveDevice 抛了，两份策略漂了'],
+    };
+  }
+  if (payload.device !== expected.device) {
+    return {
+      name: 'device', ok: false,
+      detail: `设备判定不一致：桥说 ${payload.device}，doctor 算 ${expected.device}`
+        + `（requested=${expected.requested}）`,
+      lines: ['     → 桥的 resolve_device 与 omnishotcut.js 的 resolveDevice 漂了，按 requested 修一处'],
+    };
+  }
+
+  const torch = parseTorchFlavor(payload.torch, payload.cudaVersion);
+  const threads = Number(payload.threads) || 0;
+  const lines = [
+    `     requested=${payload.requested ?? 'auto'}  cudaAvailable=${cudaAvailable}`
+    + (payload.gpu ? `  gpu=${payload.gpu}` : ''),
+  ];
+  if (payload.torchvision) lines.push(`     torchvision ${String(payload.torchvision)}`);
+  return {
+    name: 'device', ok: true,
+    detail: `device: ${payload.device} — torch ${torch.label}, threads ${threads}`,
+    lines,
+  };
+}
+
 /** doctor 里那条 import 探针 —— 与 `findPython` 同一判据：光"能执行"不算数。 */
 const IMPORT_PROBE = 'import omnishotcut,sys;print(getattr(omnishotcut,"__version__","?"));'
   + 'print(sys.version.split()[0])';
@@ -551,8 +757,12 @@ const IMPORT_PROBE = 'import omnishotcut,sys;print(getattr(omnishotcut,"__versio
  * - `quiet: true` 表示"只有 lines，没有 ✅/❌"（配置来源那一行就是这种）；
  * - `fatal: false` 表示不算硬伤（默认 `ok:false` 就算）。
  *
- * 依赖全部注入：`run(bin, args) -> {code, stdout, stderr}`、`stat(p) -> stat|null`。
+ * 依赖全部注入：`run(bin, args, timeoutMs?) -> {code, stdout, stderr}`、`stat(p) -> stat|null`。
  * 所以这个函数不起进程也能测。
+ *
+ * 五项的顺序就是用户排查的顺序：配置来源 → python → device → ckpt → bridge。
+ * `device` 那项会跑一次 `python <bridge> --probe-device`（要 import torch，慢 1–3 s，
+ * 所以它给了 30 s 超时；`run` 的默认 8 s 不够）。
  */
 export async function doctorChecks({ config, sourceText, run, stat } = {}) {
   const osm = config?.omnishotcut ?? {};
@@ -592,6 +802,9 @@ export async function doctorChecks({ config, sourceText, run, stat } = {}) {
       });
     }
   }
+
+  // ---- 设备：auto 有卡走 cuda、没卡走 cpu；显式要 cuda 却没卡 → 硬伤
+  out.push(await deviceCheck(osm, run));
 
   // ---- 权重：要有，而且明显不对的（占位文件 / LFS 指针）要当场说
   if (!osm.ckpt) {

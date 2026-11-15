@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased]
+
+> 这一版只做一件事：**OmniShotCut 后端设备自适应** —— 有 N 卡走 CUDA、没卡走 CPU，
+> 并且把"装错 torch 版本"从"悄悄慢 4 倍"变成"自检里当场 FAIL"。
+
+### Added — `DSH_OSM_DEVICE` / `DSH_OSM_THREADS`；安装脚本；doctor 的 device 项
+
+- 桥（`src/storyboard/omnishotcut-bridge.py`）新增设备解析：`auto`（默认，按
+  `torch.cuda.is_available()` 选）/ `cpu` / `cuda`。**显式 `cuda` 但不可用直接报
+  `device-unavailable`**，不静默降级。CPU 时在**本进程内**把 vendor 写死的
+  `.to("cuda")` 重定向到 cpu（照 `bench/slim/device_shim.py` 的做法，不改 `vendor/`），
+  并把线程数设为 4（`DSH_OSM_THREADS` 可覆盖）。每次启动往 stderr 打一行
+  `device=cpu threads=4 torch=2.11.0+cpu requested=cpu`。
+- 桥新增 `--probe-device`：只解析设备、吐一行 JSON，doctor 与安装脚本都用它。
+- `doctor` 新增 device 项：印出解析到的 device、torch 版本（`+cpu` / `+cu128`）、线程数、
+  显卡名；显式 `cuda` 不可用算硬伤并给修复建议。桥与 JS 的判定不一致也会 FAIL（防两份策略漂移）。
+- `scripts/install-omnishotcut.ps1`：按 `nvidia-smi` 自动选 flavor（`cu128` / `cpu`），
+  带 `-Cpu` / `-Cuda <ver>` / `-Venv` / `-Minimal` / `-Force`；**目标 venv 里是 CUDA 版而这次要装
+  CPU 版时要求 `-Force`**（历史事故：`pip install -e .` 把 CUDA torch 换成 CPU 版）；
+  `omnishotcut` 一律 `--no-deps` 安装。
+- 文档 `安装-OmniShotCut.md`：两条命令、体积/耗时对照、两个环境变量、装坏了怎么恢复。
+
+### Verified
+
+- CPU 与 GPU 的切点 **0 帧差异**（`02b-dissolve1s` 两路出板 PNG sha256 与 manifest 逐字节相同）；
+- 每窗前向 GPU 0.07 s vs CPU 0.755 s；venv 4,984 MB vs 797 MB；
+- `node --test` 681 项（新增 `test/omnishotcut-device.test.mjs` 14 项）。
+
 ## [0.7.4] - 2026-11-11
 
 > 这一版只做一件事：**不拿真画面换省钱**。以前为了凑行高会把格子拉成 1.3:1 再 cover 裁掉
