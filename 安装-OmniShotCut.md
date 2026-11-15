@@ -32,25 +32,25 @@ node bin\doctor.mjs                                    # 第 5 节会印 device=
 
 > 下面两节分别讲两种装法。**默认（不带参数）装的是 CPU**。
 
-### 1.1 有 N 卡（Windows + 驱动正常，`nvidia-smi` 能报出型号）
+### 1.1 CPU（默认，推荐所有人——有显卡也一样）
 
 ```powershell
 cd <仓库根>
-pwsh -File plugin\scripts\install-omnishotcut.ps1
-# 等价于：-Cuda cu128，venv = env\venv
+pwsh -File plugin\scripts\install-omnishotcut.ps1        # 不带参数 = CPU
+# 装的是 torch +cpu，体积约 557 MB
 ```
 
-装的是 `torch 2.11.0+cu128` / `torchvision 0.26.0+cu128`，索引 `https://download.pytorch.org/whl/cu128`。
+装的是 `torch 2.15.0+cpu` / `torchvision 0.29.2+cpu`（索引 `.../whl/cpu`），体积约 557 MB；`torch.cuda.is_available()=False` 是**预期**。
 
-### 1.2 没 N 卡（或就想跑 CPU）
+### 1.2 想用显卡（实验性）：显式 `-Cuda`
 
 ```powershell
 cd <仓库根>
-pwsh -File plugin\scripts\install-omnishotcut.ps1 -Cpu -Venv env\venv-cpu
-# 想省体积再加 -Minimal
+pwsh -File plugin\scripts\install-omnishotcut.ps1 -Cuda cu128 -Venv env\venv-cu
+# 只有批量处理几十条片子才划算；体积 4,984 MB
 ```
 
-装的是 `torch 2.15.0+cpu` / `torchvision 0.29.2+cpu`（索引 `.../whl/cpu`，版本由索引当前提供的最新版决定）。
+装的是 `torch 2.11.0+cu128` / `torchvision 0.26.0+cu128`（索引 `.../whl/cu128`），体积 4,984 MB。**实验性**：不做多版本矩阵，出问题不阻塞发布；冷出板比 CPU 快 1.4–6 倍。
 
 ### 1.3 参数
 
